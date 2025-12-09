@@ -14,8 +14,8 @@ import sys
 ORIGINAL_STATS_CMD = "grep \"STATS.*num_to_post\" {log_file} | cut -d'=' -f2"
 
 # --- Analysis 2: Attachments/Elapsed_time (Two Lines) ---
-DOWNLOAD_CMD = "grep 'Downloading [0-9]\\+ attachments' {log_file} | grep -oE '[0-9]+'"
-MONITOR_STATS_CMD = "grep 'STATS.*monitor_download' {log_file} | grep -oE '{{.*}}'"
+DOWNLOAD_CMD = "grep 'Downloading [0-9]\\+ attachment' {log_file} | grep -oE '[0-9]+'"
+MONITOR_STATS_CMD = "grep 'STATS.*monitor_download' {log_file} | cut -d' ' -f6-"
 
 # --- Analysis 3: Post Durations (Three Lines) ---
 POST_NUM_IMAGES_CMD = "grep \"PluginMastodon::enqueueContent: called with params.linkId\" {log_file} | cut -d' ' -f10,11"
@@ -85,7 +85,7 @@ def parse_multiline_stream(download_cmd, stats_cmd, log_file):
     parsed_data = []
     for count, json_str in zip(counts, json_strings):
         try:
-            data = json.loads(json_str.strip())
+            data = json.loads(json_str.split('=')[1].strip())
             data['num_images'] = count 
             if 'elapsed_time' in data: parsed_data.append(data)
             else: raise KeyError("Missing 'elapsed_time' after parsing.")
