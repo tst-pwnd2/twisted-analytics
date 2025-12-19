@@ -1,3 +1,5 @@
+
+
 import subprocess
 import json
 from collections import defaultdict
@@ -14,11 +16,11 @@ import sys
 TGEN_POSTING_CMD = "grep \"STATS.*num_to_post\" {log_file} | cut -d'=' -f2"
 
 # 2. tgenFetching (Two-Line Attachments Stats)
-DOWNLOAD_CMD = "grep 'Downloading [0-9]\\+ attachment' {log_file} | cut -d' ' -f7"
-MONITOR_STATS_CMD = "grep 'STATS.*monitor_download' {log_file} | cut -d' ' -f6-"
+DOWNLOAD_CMD = "grep 'Downloading [0-9]\\+ attachment' {log_file} | cut -d' ' -f5"
+MONITOR_STATS_CMD = "grep 'STATS.*monitor_download' {log_file} | cut -d' ' -f4-"
 
 # 3. raceboatPosting (Three-Line Post Durations)
-RACEBOAT_POSTING_IMAGES_CMD = "grep \"PluginMastodon::enqueueContent: called with params.linkId\" {log_file} | cut -d' ' -f10,11"
+RACEBOAT_POSTING_IMAGES_CMD = "grep \"PluginMastodon::enqueueContent: called with params.linkId\" {log_file} | cut -d' ' -f10,11,12"
 RACEBOAT_POSTING_START_CMD = "grep \"Raceboat::TransportComponentWrapper::doAction: called with handlesJson\" {log_file} | cut -d' ' -f2,11"
 RACEBOAT_POSTING_STOP_CMD = "grep \"PluginCommsTwoSixStubUserModelReactiveFile::onTransportEvent: called with event.json\" {log_file} | cut -d' ' -f2"
 
@@ -56,13 +58,18 @@ def process_and_analyze_data(data):
     Groups data by 'num_images' and calculates statistics, returning a JSON-serializable dictionary.
     """
     grouped_times = defaultdict(list)
-    for item in data: grouped_times[item['num_images']].append(item['elapsed_time'])
+    for item in data: grouped_times[item['num_images']].append({'duration': item['elapsed_time'], 'sizes': item.get('sizes', [0])})
 
     analysis_results = {}
-    for num_images, times_list in grouped_times.items():
-        if len(times_list) < 2: continue
-            
+    for num_images, data in grouped_times.items():
+        if len(data) < 2: continue
+
+        print(f'{data=}')
+        times_list = [e['duration'] for e in data]
+        sizes_list = [e['sizes'] for e in data]
+        print(sizes_list)
         times_array = np.array(times_list)
+        sizes_array = np.array(sizes_list)
         
         # Calculate statistics
         min_val = np.min(times_array); max_val = np.max(times_array)
@@ -85,7 +92,8 @@ def process_and_analyze_data(data):
             'median': float(median_val),
             'std': float(std_val),
             'emd_vs_normal': float(emd_val),
-            'elapsed_times': times_list # Include raw list
+            'elapsed_times': times_list, # Include raw list
+            'sizes': sizes_list
         }
     return analysis_results
 
@@ -101,7 +109,8 @@ def parse_tgen_posting(log_file):
         if clean_line:
             try:
                 data = json.loads(clean_line)
-                if 'num_to_post' in data: data['num_images'] = data.pop('num_to_post') 
+                if 'num_to_post' in data: data['num_images'] = data.pop('num_to_post')
+                data['sizes'] = [0] * data['num_images']
                 if 'num_images' in data and 'elapsed_time' in data: parsed_data.append(data)
                 else: raise KeyError("Missing 'num_images' or 'elapsed_time'.")
             except (json.JSONDecodeError, KeyError) as e:
@@ -137,11 +146,18 @@ def parse_rb_post_images(log_file):
     for line in lines:
         try:
             action_id_match = re.search(r'action\.actionId=(\d+)', line)
+            image_size_match = re.search(r'content\.size\(\)=(\d+)', line)
             json_match = re.search(r'action\.json=({.*}),', line)
             if not action_id_match or not json_match: raise ValueError("Missing action ID or JSON payload.")
-            action_id = int(action_id_match.group(1)); data = json.loads(json_match.group(1))
+            action_id = int(action_id_match.group(1))
+            data = json.loads(json_match.group(1))
+            image_size = int(image_size_match.group(1))
             if 'numImages' not in data: raise KeyError("Missing 'numImages' key in JSON payload.")
-            data_map[action_id] = {'num_images': data['numImages']}
+            if action_id not in data_map:
+                data_map[action_id] = {'num_images': data['numImages'], 'sizes': []}
+
+            data_map[action_id]['sizes'].append(image_size)
+    
         except (ValueError, KeyError, json.JSONDecodeError) as e:
             print(f"⚠️ ERROR (raceboatPosting/Images): Skipping line due to {type(e).__name__}: {e}. Data: {line[:60]}")
     return data_map
@@ -171,13 +187,14 @@ def parse_rb_post_stop(log_file):
     return time_list
 
 def parse_raceboat_posting(log_file):
-    num_images_data = parse_rb_post_images(log_file)
+    enqueue_data = parse_rb_post_images(log_file)
     start_data = parse_rb_post_start(log_file)
     stop_times = parse_rb_post_stop(log_file)
     
     merged_by_id = {}; final_data = []
-    for action_id, img_data in num_images_data.items():
-        if action_id in start_data: merged_by_id[action_id] = {**img_data, **start_data[action_id]}
+    for action_id, enqueue_event in enqueue_data.items():
+        if action_id in start_data:
+            merged_by_id[action_id] = {**enqueue_event, **start_data[action_id]}
 
     sorted_starts = sorted(merged_by_id.values(), key=lambda x: x['start_time'])
     
@@ -187,6 +204,7 @@ def parse_raceboat_posting(log_file):
             if duration <= 0: raise ValueError("Duration is non-positive (stop time <= start time).")
             
             final_data.append({
+                'sizes': start_event['sizes'],
                 'num_images': start_event['num_images'], 
                 'elapsed_time': duration
             })
