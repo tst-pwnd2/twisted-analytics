@@ -16,8 +16,7 @@ import sys
 TGEN_POSTING_CMD = "grep \"STATS.*num_to_post\" {log_file} | cut -d'=' -f2"
 
 # 2. tgenFetching (Two-Line Attachments Stats)
-DOWNLOAD_CMD = "grep 'Downloading [0-9]\\+ attachment' {log_file} | cut -d' ' -f5"
-MONITOR_STATS_CMD = "grep 'STATS.*monitor_download' {log_file} | cut -d' ' -f4-"
+MONITOR_STATS_CMD = "grep 'STATS.*download' {log_file} | cut -d' ' -f4-"
 
 # 3. raceboatPosting (Three-Line Post Durations)
 RACEBOAT_POSTING_IMAGES_CMD = "grep \"PluginMastodon::enqueueContent: called with params.linkId\" {log_file} | cut -d' ' -f10,11,12"
@@ -44,7 +43,9 @@ def execute_shell_command(command, log_file):
             shell=True,
             check=True
         )
-        return result.stdout.strip().split('\n')
+        result = result.stdout.strip().split('\n')
+        # print(f'{command=}: {result=}')
+        return result
     except subprocess.CalledProcessError as e:
         if e.returncode == 1: 
             return []
@@ -64,10 +65,10 @@ def process_and_analyze_data(data):
     for num_images, data in grouped_times.items():
         if len(data) < 2: continue
 
-        print(f'{data=}')
+        # print(f'{data=}')
         times_list = [e['duration'] for e in data]
         sizes_list = [e['sizes'] for e in data]
-        print(sizes_list)
+        # print(sizes_list)
         times_array = np.array(times_list)
         sizes_array = np.array(sizes_list)
         
@@ -119,19 +120,14 @@ def parse_tgen_posting(log_file):
 
 # --- Analysis: tgenFetching ---
 def parse_tgen_fetching(log_file):
-    counts = [int(c.strip()) for c in execute_shell_command(DOWNLOAD_CMD, log_file) if c.strip().isdigit()]
-    json_strings = execute_shell_command(MONITOR_STATS_CMD, log_file)
-        
-    if len(counts) != len(json_strings) and (counts or json_strings):
-        print(f"⚠️ WARNING (tgenFetching): Mismatched counts! Found {len(counts)} counts and {len(json_strings)} JSON objects.")
-        
+       
     parsed_data = []
-    for count, json_str in zip(counts, json_strings):
+    for json_str in execute_shell_command(MONITOR_STATS_CMD, log_file):
         try:
             json_payload = json_str.split('STATS=')[1].strip()
             data = json.loads(json_payload)
             
-            data['num_images'] = count 
+            data['num_images'] = int(data['total_requests']) - 1
             if 'elapsed_time' in data: parsed_data.append(data)
             else: raise KeyError("Missing 'elapsed_time' after parsing.")
         except (json.JSONDecodeError, KeyError, IndexError) as e:
@@ -148,7 +144,9 @@ def parse_rb_post_images(log_file):
             action_id_match = re.search(r'action\.actionId=(\d+)', line)
             image_size_match = re.search(r'content\.size\(\)=(\d+)', line)
             json_match = re.search(r'action\.json=({.*}),', line)
-            if not action_id_match or not json_match: raise ValueError("Missing action ID or JSON payload.")
+            if not action_id_match or not json_match:
+                print("Problem line: ", line)
+                raise ValueError("Missing action ID or JSON payload.")
             action_id = int(action_id_match.group(1))
             data = json.loads(json_match.group(1))
             image_size = int(image_size_match.group(1))
