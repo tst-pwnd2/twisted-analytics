@@ -32,6 +32,9 @@ IODINE_UPSTREAM_RECV_CMD = "grep \"Received Iodine Control Message Type:\" {log_
 IODINE_DOWNSTREAM_SEND_CMD = "grep \"Sending .*via Iodine\" {log_file} | cut -d' ' -f1,2"
 IODINE_DOWNSTREAM_RECV_CMD = "grep \"Recieved Iodine Message for File\" {log_file} | cut -d' ' -f1,2"
 
+# 6. Tgen DNS Analysis
+TGEN_DNS_CMD = "grep \"STATS=\" {log_file} | cut -d'=' -f2"
+
 # Timestamp format for parsing (H:M:S.microseconds)
 TIME_FORMAT = '%Y-%m-%d %H:%M:%S.%f'
 
@@ -111,6 +114,35 @@ def process_and_analyze_data(data, include_sizes=True):
     return analysis_results
 
 # --- Specific Parsing Logic ---
+
+def parse_tgen_dns(log_file):
+    """Parses resolve_a and resolve_a_batch entries from tgen dns logs."""
+    lines = execute_shell_command(TGEN_DNS_CMD, log_file)
+    parsed_data = []
+    for line in lines:
+        try:
+            clean_line = line.strip().strip('"')
+            if not clean_line: continue
+            data = json.loads(clean_line)
+            
+            # Skip "wait" type
+            if data.get("type") == "wait":
+                continue
+                
+            num_to_resolve = 0
+            if data.get("type") == "resolve_a_batch":
+                num_to_resolve = data.get("num_to_resolve", 0)
+            elif data.get("type") == "resolve_a":
+                num_to_resolve = 1
+                
+            if num_to_resolve > 0 and 'elapsed_time' in data:
+                parsed_data.append({
+                    'num_images': num_to_resolve,
+                    'elapsed_time': data['elapsed_time']
+                })
+        except Exception as e:
+            print(f"⚠️ ERROR (tgenDns): {e} on line: {line[:60]}")
+    return parsed_data
 
 def parse_tgen_posting(log_file):
     lines = execute_shell_command(TGEN_POSTING_CMD, log_file)
@@ -252,8 +284,8 @@ def parse_iodine_duration(send_cmd, recv_cmd, send_log, recv_log):
 # --- Main Execution ---
 
 if __name__ == "__main__":
-    if len(sys.argv) != 7:
-        print("Usage: python monitor_parse.py <tgen_log> <rb_post_log> <rb_fetch_log> <app_client_log> <app_server_log> <results_json>")
+    if len(sys.argv) != 8:
+        print("Usage: python monitor_parse.py <tgen_log> <rb_post_log> <rb_fetch_log> <app_client_log> <app_server_log> <tgen_dns_log> <results_json>")
         sys.exit(1)
 
     TGEN_LOG = sys.argv[1]
@@ -261,14 +293,16 @@ if __name__ == "__main__":
     RB_FETCH_LOG = sys.argv[3]
     APP_CLIENT_LOG = sys.argv[4]
     APP_SERVER_LOG = sys.argv[5]
-    RESULTS_FILE = sys.argv[6]
+    TGEN_DNS_LOG = sys.argv[6]
+    RESULTS_FILE = sys.argv[7]
 
     log_files = {
         "Tgen Log": TGEN_LOG,
         "Raceboat Post Log": RB_POST_LOG,
         "Raceboat Fetch Log": RB_FETCH_LOG,
         "App Client Log": APP_CLIENT_LOG,
-        "App Server Log": APP_SERVER_LOG
+        "App Server Log": APP_SERVER_LOG,
+        "Tgen DNS Log": TGEN_DNS_LOG
     }
 
     # Pre-flight check: Issue warnings for missing files instead of exiting
@@ -320,6 +354,13 @@ if __name__ == "__main__":
         )
     else:
         output['iodineDownstream'] = {}
+
+    # 6. tgenDns
+    if os.path.exists(TGEN_DNS_LOG):
+        print(f"Analyzing {TGEN_DNS_LOG} for tgenDns...")
+        output['tgenDns'] = process_and_analyze_data(parse_tgen_dns(TGEN_DNS_LOG), include_sizes=False)
+    else:
+        output['tgenDns'] = {}
 
     # Save to JSON
     try:
