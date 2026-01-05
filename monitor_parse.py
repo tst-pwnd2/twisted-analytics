@@ -20,15 +20,15 @@ MONITOR_STATS_CMD = "grep 'STATS.*download' {log_file} | cut -d' ' -f4-"
 
 # 3. raceboatPosting (Three-Line Post Durations)
 RACEBOAT_POSTING_IMAGES_CMD = "grep \"PluginMastodon::enqueueContent: called with params.linkId\" {log_file} | cut -d' ' -f10,11,12"
-RACEBOAT_POSTING_START_CMD = "grep \"Raceboat::TransportComponentWrapper::doAction: called with handlesJson\" {log_file} | cut -d' ' -f2,11"
-RACEBOAT_POSTING_STOP_CMD = "grep \"PluginCommsTwoSixStubUserModelReactiveFile::onTransportEvent: called with event.json\" {log_file} | cut -d' ' -f2"
+RACEBOAT_POSTING_START_CMD = "grep \"Raceboat::TransportComponentWrapper::doAction: called with handlesJson\" {log_file} | cut -d' ' -f1,2,11"
+RACEBOAT_POSTING_STOP_CMD = "grep \"PluginCommsTwoSixStubUserModelReactiveFile::onTransportEvent: called with event.json\" {log_file} | cut -d' ' -f1,2"
 
 # 4. raceboatFetching (Hashtag Fetch Duration)
-RACEBOAT_FETCHING_START_CMD = "grep \"PluginMastodon::doAction: Fetching from single link\" {log_file} | cut -d' ' -f2"
-RACEBOAT_FETCHING_END_CMD = "grep \"Link::fetch: .*items for hashtag\" {log_file} | cut -d' ' -f2,8"
+RACEBOAT_FETCHING_START_CMD = "grep \"PluginMastodon::doAction: Fetching from single link\" {log_file} | cut -d' ' -f1,2"
+RACEBOAT_FETCHING_END_CMD = "grep \"Link::fetch: .*items for hashtag\" {log_file} | cut -d' ' -f1,2,8"
 
 # Timestamp format for parsing (H:M:S.microseconds)
-TIME_FORMAT = '%H:%M:%S.%f'
+TIME_FORMAT = '%Y-%m-%d %H:%M:%S.%f'
 
 # --- Core Utility Functions ---
 
@@ -228,11 +228,11 @@ def parse_raceboat_fetching(log_file):
     for line in end_lines:
         try:
             parts = line.split()
-            if len(parts) != 2: raise ValueError("Unexpected log line format (not 'timestamp count').")
-            if not parts[1].isdigit(): raise ValueError("Item count is not a valid integer.")
+            if len(parts) != 3: raise ValueError("Unexpected log line format (not 'timestamp count').")
+            if not parts[2].isdigit(): raise ValueError("Item count is not a valid integer.")
                 
-            end_time = datetime.strptime(parts[0].strip().strip(':'), TIME_FORMAT)
-            item_count = int(parts[1].strip())
+            end_time = datetime.strptime(f'{parts[0]} {parts[1].strip().strip(":")}', TIME_FORMAT)
+            item_count = int(parts[2].strip())
             end_events.append({'end_time': end_time, 'num_images': item_count})
         except (ValueError, IndexError) as e:
             print(f"⚠️ ERROR (raceboatFetching/End): Skipping line due to {type(e).__name__}: {e}. Data: {line[:60]}")
