@@ -8,6 +8,11 @@ import re
 import os
 import sys
 import glob
+try:
+    import yaml
+except ImportError:
+    # Fallback or instruction if yaml is missing in the environment
+    yaml = None
 
 # --- Command Definitions (Using {log_file} placeholder) ---
 
@@ -113,6 +118,64 @@ def process_and_analyze_data(data, include_sizes=True):
         analysis_results[str(num_images)] = res
         
     return analysis_results
+
+# --- Metadata Parsing Logic ---
+
+def parse_scenario_metadata(root_dir):
+    """Searches for a single .yml file in root and extracts metadata."""
+    metadata = {}
+    yml_files = glob.glob(os.path.join(root_dir, "*.yml"))
+    
+    if not yml_files:
+        print("⚠️ WARNING: No .yml metadata file found in root.")
+        return metadata
+    if len(yml_files) > 1:
+        print(f"⚠️ WARNING: Multiple .yml files found {yml_files}. Using first one: {yml_files[0]}")
+    
+    yml_path = yml_files[0]
+    
+    if yaml is None:
+        print("❌ ERROR: 'PyYAML' library is not installed. Cannot parse metadata.")
+        return metadata
+
+    try:
+        with open(yml_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+            
+        # 1. Extract Network Section
+        net_metadata = {}
+        network_entries = cfg.get('weird_network_section', [])
+        for entry in network_entries:
+            src = entry.get('src')
+            dst = entry.get('dst')
+            params = entry.get('net_params', {})
+            if src and dst:
+                key = f"{src}_to_{dst}"
+                net_metadata[key] = {
+                    'latency': params.get('latency'),
+                    'loss': params.get('loss')
+                }
+        metadata['network_params'] = net_metadata
+        
+        # 2. Extract Application Section
+        app_cfg = cfg.get('application', {})
+        iodine_cfg = app_cfg.get('iodine', {})
+        
+        metadata['iodine_config'] = {
+            'max_query_length': iodine_cfg.get('max_query_length'),
+            'max_response_size': iodine_cfg.get('max_response_size')
+        }
+
+        # Extract raceboat_prof_config for alice and bob
+        metadata['raceboat_config'] = {
+            'alice_prof_config': app_cfg.get('alice', {}).get('raceboat_prof_config'),
+            'bob_prof_config': app_cfg.get('bob', {}).get('raceboat_prof_config')
+        }
+            
+    except Exception as e:
+        print(f"❌ ERROR: Failed to parse metadata file {yml_path}: {e}")
+        
+    return metadata
 
 # --- Specific Parsing Logic ---
 
@@ -323,6 +386,10 @@ if __name__ == "__main__":
     print(f"🔍 Found {len(TGEN_MASTODON_FILES)} Tgen Mastodon log files.")
 
     output = {}
+
+    # 0. Metadata Extraction
+    print(f"🔍 Extracting scenario metadata from {ROOT_DIR}...")
+    output['scenario_metadata'] = parse_scenario_metadata(ROOT_DIR)
 
     # 1. tgenPosting & tgenFetching
     if TGEN_MASTODON_FILES:
