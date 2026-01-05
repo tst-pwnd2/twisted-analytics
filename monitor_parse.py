@@ -1,5 +1,3 @@
-
-
 import subprocess
 import json
 from collections import defaultdict
@@ -12,20 +10,27 @@ import sys
 
 # --- Command Definitions (Using {log_file} placeholder) ---
 
-# 1. tgenPosting (Original Single-Line Stats)
+# 1. tgenPosting
 TGEN_POSTING_CMD = "grep \"STATS.*num_to_post\" {log_file} | cut -d'=' -f2"
 
-# 2. tgenFetching (Two-Line Attachments Stats)
+# 2. tgenFetching
 MONITOR_STATS_CMD = "grep 'STATS.*download' {log_file} | cut -d' ' -f4-"
 
-# 3. raceboatPosting (Three-Line Post Durations)
+# 3. raceboatPosting
 RACEBOAT_POSTING_IMAGES_CMD = "grep \"PluginMastodon::enqueueContent: called with params.linkId\" {log_file} | cut -d' ' -f10,11,12"
 RACEBOAT_POSTING_START_CMD = "grep \"Raceboat::TransportComponentWrapper::doAction: called with handlesJson\" {log_file} | cut -d' ' -f1,2,11"
 RACEBOAT_POSTING_STOP_CMD = "grep \"PluginCommsTwoSixStubUserModelReactiveFile::onTransportEvent: called with event.json\" {log_file} | cut -d' ' -f1,2"
 
-# 4. raceboatFetching (Hashtag Fetch Duration)
+# 4. raceboatFetching
 RACEBOAT_FETCHING_START_CMD = "grep \"PluginMastodon::doAction: Fetching from single link\" {log_file} | cut -d' ' -f1,2"
 RACEBOAT_FETCHING_END_CMD = "grep \"Link::fetch: .*items for hashtag\" {log_file} | cut -d' ' -f1,2,8"
+
+# 5. Iodine Analysis
+IODINE_UPSTREAM_SEND_CMD = "grep \"Sending .*via Iodine\" {log_file} | cut -d' ' -f1,2"
+IODINE_UPSTREAM_RECV_CMD = "grep \"Received Iodine Control Message Type:\" {log_file} | cut -d' ' -f1,2"
+
+IODINE_DOWNSTREAM_SEND_CMD = "grep \"Sending .*via Iodine\" {log_file} | cut -d' ' -f1,2"
+IODINE_DOWNSTREAM_RECV_CMD = "grep \"Recieved Iodine Message for File\" {log_file} | cut -d' ' -f1,2"
 
 # Timestamp format for parsing (H:M:S.microseconds)
 TIME_FORMAT = '%Y-%m-%d %H:%M:%S.%f'
@@ -33,7 +38,10 @@ TIME_FORMAT = '%Y-%m-%d %H:%M:%S.%f'
 # --- Core Utility Functions ---
 
 def execute_shell_command(command, log_file):
-    """Executes a shell command gracefully."""
+    """Executes a shell command gracefully and returns lines."""
+    if not log_file or not os.path.exists(log_file):
+        return []
+        
     full_command = command.format(log_file=log_file)
     try:
         result = subprocess.run(
@@ -43,49 +51,48 @@ def execute_shell_command(command, log_file):
             shell=True,
             check=True
         )
-        result = result.stdout.strip().split('\n')
-        # print(f'{command=}: {result=}')
-        return result
+        return result.stdout.strip().split('\n')
     except subprocess.CalledProcessError as e:
         if e.returncode == 1: 
             return []
         print(f"❌ ERROR: Shell command failed: {full_command}. Stderr: {e.stderr.strip()}")
         return []
 
-# --- Statistical Processing (Returns serializable dictionary) ---
-
-def process_and_analyze_data(data):
-    """
-    Groups data by 'num_images' and calculates statistics, returning a JSON-serializable dictionary.
-    """
+def process_and_analyze_data(data, include_sizes=True):
+    """Groups data by 'num_images' and calculates statistics for JSON output."""
+    if not data:
+        return {}
+        
     grouped_times = defaultdict(list)
-    for item in data: grouped_times[item['num_images']].append({'duration': item['elapsed_time'], 'sizes': item.get('sizes', [0])})
+    for item in data:
+        num_imgs = item['num_images']
+        entry = {'duration': item['elapsed_time']}
+        if include_sizes:
+            entry['sizes'] = item.get('sizes', [0])
+        grouped_times[num_imgs].append(entry)
 
     analysis_results = {}
-    for num_images, data in grouped_times.items():
-        if len(data) < 2: continue
+    for num_images in sorted(grouped_times.keys(), key=lambda x: int(x)):
+        group_data = grouped_times[num_images]
+        if len(group_data) < 2: 
+            continue
 
-        # print(f'{data=}')
-        times_list = [e['duration'] for e in data]
-        sizes_list = [e['sizes'] for e in data]
-        # print(sizes_list)
+        times_list = [e['duration'] for e in group_data]
         times_array = np.array(times_list)
-        sizes_array = np.array(sizes_list)
         
-        # Calculate statistics
-        min_val = np.min(times_array); max_val = np.max(times_array)
-        mean_val = np.mean(times_array); median_val = np.median(times_array)
+        min_val = np.min(times_array)
+        max_val = np.max(times_array)
+        mean_val = np.mean(times_array)
+        median_val = np.median(times_array)
         std_val = np.std(times_array)
 
-        # Earth Mover's Distance (Wasserstein Distance)
         emd_val = 0.0
         if std_val > 0:
             N = len(times_array) * 10 
             normal_sample = np.random.normal(loc=mean_val, scale=std_val, size=N)
             emd_val = wasserstein_distance(times_array, normal_sample)
 
-        # Convert all statistical results to native Python floats for JSON serialization
-        analysis_results[str(num_images)] = {
+        res = {
             'count': len(times_list),
             'min': float(min_val),
             'max': float(max_val),
@@ -93,256 +100,231 @@ def process_and_analyze_data(data):
             'median': float(median_val),
             'std': float(std_val),
             'emd_vs_normal': float(emd_val),
-            'elapsed_times': times_list, # Include raw list
-            'sizes': sizes_list
+            'elapsed_times': times_list
         }
+        
+        if include_sizes:
+            res['sizes'] = [e['sizes'] for e in group_data]
+            
+        analysis_results[str(num_images)] = res
+        
     return analysis_results
 
-# --- Parsing Functions (Refactored to match new names) ---
+# --- Specific Parsing Logic ---
 
-# --- Analysis: tgenPosting ---
 def parse_tgen_posting(log_file):
     lines = execute_shell_command(TGEN_POSTING_CMD, log_file)
-    if not lines: return []
     parsed_data = []
     for line in lines:
-        clean_line = line.strip().strip('"')
-        if clean_line:
-            try:
-                data = json.loads(clean_line)
-                if 'num_to_post' in data: data['num_images'] = data.pop('num_to_post')
-                data['sizes'] = [0] * data['num_images']
-                if 'num_images' in data and 'elapsed_time' in data: parsed_data.append(data)
-                else: raise KeyError("Missing 'num_images' or 'elapsed_time'.")
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"⚠️ ERROR (tgenPosting): Skipping line due to {type(e).__name__}: {e}. Data: {clean_line[:60]}")
+        try:
+            clean_line = line.strip().strip('"')
+            if not clean_line: continue
+            data = json.loads(clean_line)
+            num_imgs = data.pop('num_to_post', data.get('num_images', 0))
+            parsed_data.append({
+                'num_images': num_imgs,
+                'elapsed_time': data['elapsed_time'],
+                'sizes': [0] * num_imgs
+            })
+        except Exception as e:
+            print(f"⚠️ ERROR (tgenPosting): {e} on line: {line[:60]}")
     return parsed_data
 
-# --- Analysis: tgenFetching ---
 def parse_tgen_fetching(log_file):
-       
     parsed_data = []
     for json_str in execute_shell_command(MONITOR_STATS_CMD, log_file):
         try:
             json_payload = json_str.split('STATS=')[1].strip()
             data = json.loads(json_payload)
-            
-            data['num_images'] = int(data['total_requests']) - 1
-            if 'elapsed_time' in data: parsed_data.append(data)
-            else: raise KeyError("Missing 'elapsed_time' after parsing.")
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            print(f"⚠️ ERROR (tgenFetching): Skipping pair due to {type(e).__name__}: {e}. JSON: {json_str[:60]}")
-            
+            parsed_data.append({
+                'num_images': int(data['total_requests']) - 1,
+                'elapsed_time': data['elapsed_time']
+            })
+        except Exception as e:
+            print(f"⚠️ ERROR (tgenFetching): {e} on string: {json_str[:60]}")
     return parsed_data
 
-# --- Analysis: raceboatPosting Helpers ---
-
-def parse_rb_post_images(log_file):
-    data_map = {}; lines = execute_shell_command(RACEBOAT_POSTING_IMAGES_CMD, log_file)
-    for line in lines:
-        try:
-            action_id_match = re.search(r'action\.actionId=(\d+)', line)
-            image_size_match = re.search(r'content\.size\(\)=(\d+)', line)
-            json_match = re.search(r'action\.json=({.*}),', line)
-            if not action_id_match or not json_match:
-                print("Problem line: ", line)
-                raise ValueError("Missing action ID or JSON payload.")
-            action_id = int(action_id_match.group(1))
-            data = json.loads(json_match.group(1))
-            image_size = int(image_size_match.group(1))
-            if 'numImages' not in data: raise KeyError("Missing 'numImages' key in JSON payload.")
-            if action_id not in data_map:
-                data_map[action_id] = {'num_images': data['numImages'], 'sizes': []}
-
-            data_map[action_id]['sizes'].append(image_size)
-    
-        except (ValueError, KeyError, json.JSONDecodeError) as e:
-            print(f"⚠️ ERROR (raceboatPosting/Images): Skipping line due to {type(e).__name__}: {e}. Data: {line[:60]}")
-    return data_map
-
-def parse_rb_post_start(log_file):
-    data_map = {}; lines = execute_shell_command(RACEBOAT_POSTING_START_CMD, log_file)
-    for line in lines:
-        try:
-            parts = line.split(': id:'); 
-            if len(parts) != 2: raise ValueError("Unexpected log line format (missing ': id:').")
-            timestamp_str = parts[0].strip(); action_id = int(parts[1].strip().strip('}'))
-            time_obj = datetime.strptime(timestamp_str, TIME_FORMAT)
-            data_map[action_id] = {'start_time': time_obj}
-        except (ValueError, IndexError) as e:
-            print(f"⚠️ ERROR (raceboatPosting/Start): Skipping line due to {type(e).__name__}: {e}. Data: {line[:60]}")
-    return data_map
-
-def parse_rb_post_stop(log_file):
-    time_list = []; lines = execute_shell_command(RACEBOAT_POSTING_STOP_CMD, log_file)
-    for line in lines:
-        try:
-            timestamp_str = line.strip().strip(':')
-            time_obj = datetime.strptime(timestamp_str, TIME_FORMAT)
-            time_list.append(time_obj)
-        except (ValueError, IndexError) as e:
-            print(f"⚠️ ERROR (raceboatPosting/Stop): Skipping line due to {type(e).__name__}: {e}. Data: {line[:60]}")
-    return time_list
-
 def parse_raceboat_posting(log_file):
-    enqueue_data = parse_rb_post_images(log_file)
-    start_data = parse_rb_post_start(log_file)
-    stop_times = parse_rb_post_stop(log_file)
-    
-    merged_by_id = {}; final_data = []
-    for action_id, enqueue_event in enqueue_data.items():
-        if action_id in start_data:
-            merged_by_id[action_id] = {**enqueue_event, **start_data[action_id]}
+    enqueue_lines = execute_shell_command(RACEBOAT_POSTING_IMAGES_CMD, log_file)
+    start_lines = execute_shell_command(RACEBOAT_POSTING_START_CMD, log_file)
+    stop_lines = execute_shell_command(RACEBOAT_POSTING_STOP_CMD, log_file)
 
-    sorted_starts = sorted(merged_by_id.values(), key=lambda x: x['start_time'])
-    
-    for start_event, stop_time in zip(sorted_starts, stop_times):
+    if not enqueue_lines or not start_lines or not stop_lines:
+        return []
+
+    action_data = {}
+    for line in enqueue_lines:
         try:
-            duration = (stop_time - start_event['start_time']).total_seconds()
-            if duration <= 0: raise ValueError("Duration is non-positive (stop time <= start time).")
-            
+            aid = int(re.search(r'action\.actionId=(\d+)', line).group(1))
+            size = int(re.search(r'content\.size\(\)=(\d+)', line).group(1))
+            meta = json.loads(re.search(r'action\.json=({.*}),', line).group(1))
+            if aid not in action_data:
+                action_data[aid] = {'num_images': meta['numImages'], 'sizes': []}
+            action_data[aid]['sizes'].append(size)
+        except Exception as e: print(f"⚠️ ERROR (rbPost/Images): {e}")
+
+    start_times = {}
+    for line in start_lines:
+        try:
+            parts = line.split(': id:')
+            ts = datetime.strptime(parts[0].strip(), TIME_FORMAT)
+            aid = int(parts[1].strip().strip('}'))
+            start_times[aid] = ts
+        except Exception as e: print(f"⚠️ ERROR (rbPost/Start): {e}")
+
+    stop_times = []
+    for line in stop_lines:
+        try:
+            ts = datetime.strptime(line.strip().strip(':'), TIME_FORMAT)
+            stop_times.append(ts)
+        except Exception as e: print(f"⚠️ ERROR (rbPost/Stop): {e}")
+
+    final_data = []
+    correlated_events = []
+    for aid, meta in action_data.items():
+        if aid in start_times:
+            correlated_events.append({**meta, 'start': start_times[aid]})
+    
+    correlated_events.sort(key=lambda x: x['start'])
+    for event, stop in zip(correlated_events, stop_times):
+        duration = (stop - event['start']).total_seconds()
+        if duration > 0:
             final_data.append({
-                'sizes': start_event['sizes'],
-                'num_images': start_event['num_images'], 
-                'elapsed_time': duration
+                'num_images': event['num_images'],
+                'elapsed_time': duration,
+                'sizes': event['sizes']
             })
-        except ValueError as e:
-            print(f"⚠️ ERROR (raceboatPosting/Merge): Skipping event due to {type(e).__name__}: {e}. Start: {start_event['start_time']}, Stop: {stop_time}")
-            
     return final_data
 
-# --- Analysis: raceboatFetching ---
 def parse_raceboat_fetching(log_file):
-    start_time_strings = execute_shell_command(RACEBOAT_FETCHING_START_CMD, log_file)
-    end_lines = execute_shell_command(RACEBOAT_FETCHING_END_CMD, log_file)
+    starts = execute_shell_command(RACEBOAT_FETCHING_START_CMD, log_file)
+    ends = execute_shell_command(RACEBOAT_FETCHING_END_CMD, log_file)
     
+    if not starts or not ends:
+        return []
+        
     start_times = []
-    for ts_str in start_time_strings:
-        try:
-            clean_ts_str = ts_str.strip().strip(':')
-            start_times.append(datetime.strptime(clean_ts_str, TIME_FORMAT))
-        except ValueError as e:
-            print(f"⚠️ ERROR (raceboatFetching/Start): Skipping time due to {type(e).__name__}: {e}. Data: {ts_str[:60]}")
+    for s in starts:
+        try: start_times.append(datetime.strptime(s.strip().strip(':'), TIME_FORMAT))
+        except Exception as e: print(f"⚠️ ERROR (rbFetch/Start): {e}")
             
-    end_events = [] 
-    for line in end_lines:
+    parsed_ends = []
+    for e in ends:
         try:
-            parts = line.split()
-            if len(parts) != 3: raise ValueError("Unexpected log line format (not 'timestamp count').")
-            if not parts[2].isdigit(): raise ValueError("Item count is not a valid integer.")
-                
-            end_time = datetime.strptime(f'{parts[0]} {parts[1].strip().strip(":")}', TIME_FORMAT)
-            item_count = int(parts[2].strip())
-            end_events.append({'end_time': end_time, 'num_images': item_count})
-        except (ValueError, IndexError) as e:
-            print(f"⚠️ ERROR (raceboatFetching/End): Skipping line due to {type(e).__name__}: {e}. Data: {line[:60]}")
+            parts = e.split()
+            ts = datetime.strptime(f"{parts[0]} {parts[1].strip(':')}", TIME_FORMAT)
+            count = int(parts[2])
+            parsed_ends.append({'end': ts, 'count': count})
+        except Exception as ex: print(f"⚠️ ERROR (rbFetch/End): {ex}")
     
     final_data = []
-    if len(start_times) != len(end_events):
-        print(f"⚠️ WARNING (raceboatFetching/Merge): Mismatched counts! Found {len(start_times)} starts and {len(end_events)} ends.")
-
-    for start_time, end_event in zip(start_times, end_events):
-        try:
-            duration = (end_event['end_time'] - start_time).total_seconds()
-            if duration <= 0: raise ValueError("Duration is non-positive (stop time <= start time).")
-            
-            final_data.append({
-                'num_images': end_event['num_images'], 
-                'elapsed_time': duration
-            })
-        except ValueError as e:
-            print(f"⚠️ ERROR (raceboatFetching/Merge): Skipping event due to {type(e).__name__}: {e}.")
-            
+    for start, end_obj in zip(start_times, parsed_ends):
+        duration = (end_obj['end'] - start).total_seconds()
+        if duration > 0:
+            final_data.append({'num_images': end_obj['count'], 'elapsed_time': duration})
     return final_data
 
-# --- Main Orchestrator ---
-
-def run_all_analyses(tgen_log, rb_post_log, rb_fetch_log):
-    """Executes all four analyses against the specified log files."""
+def parse_iodine_duration(send_cmd, recv_cmd, send_log, recv_log):
+    """Calculates duration between sending from send_log and receiving in recv_log."""
+    if not os.path.exists(send_log) or not os.path.exists(recv_log):
+        return []
+        
+    sends = execute_shell_command(send_cmd, send_log)
+    recvs = execute_shell_command(recv_cmd, recv_log)
     
-    final_results = {}
-    
-    # 1. tgenPosting
-    print("Running tgenPosting analysis (A1)...")
-    data_1 = parse_tgen_posting(tgen_log)
-    if data_1:
-        final_results['tgenPosting'] = process_and_analyze_data(data_1)
-        print(f"✅ tgenPosting complete. Found {len(data_1)} valid entries.")
-    else:
-        final_results['tgenPosting'] = {}
-        print("— Skipping tgenPosting: No valid entries found.")
-
-    # 2. tgenFetching
-    print("\nRunning tgenFetching analysis (A2)...")
-    data_2 = parse_tgen_fetching(tgen_log)
-    if data_2:
-        final_results['tgenFetching'] = process_and_analyze_data(data_2)
-        print(f"✅ tgenFetching complete. Found {len(data_2)} valid events.")
-    else:
-        final_results['tgenFetching'] = {}
-        print("— Skipping tgenFetching: No valid events found.")
-
-    # 3. raceboatPosting
-    print("\nRunning raceboatPosting analysis (A3)...")
-    data_3 = parse_raceboat_posting(rb_post_log)
-    if data_3:
-        final_results['raceboatPosting'] = process_and_analyze_data(data_3)
-        print(f"✅ raceboatPosting complete. Found {len(data_3)} valid actions.")
-    else:
-        final_results['raceboatPosting'] = {}
-        print("— Skipping raceboatPosting: No valid actions found.")
-
-    # 4. raceboatFetching
-    print("\nRunning raceboatFetching analysis (A4)...")
-    data_4 = parse_raceboat_fetching(rb_fetch_log)
-    if data_4:
-        final_results['raceboatFetching'] = process_and_analyze_data(data_4)
-        print(f"✅ raceboatFetching complete. Found {len(data_4)} valid events.")
-    else:
-        final_results['raceboatFetching'] = {}
-        print("— Skipping raceboatFetching: No valid events found.")
-
-    return final_results
+    send_times = []
+    for s in sends:
+        try: send_times.append(datetime.strptime(s.strip(), TIME_FORMAT))
+        except Exception as e: print(f"⚠️ ERROR (iodine/Send): {e}")
+            
+    recv_times = []
+    for r in recvs:
+        try: recv_times.append(datetime.strptime(r.strip(), TIME_FORMAT))
+        except Exception as e: print(f"⚠️ ERROR (iodine/Recv): {e}")
+            
+    final_data = []
+    for s_time, r_time in zip(send_times, recv_times):
+        duration = (r_time - s_time).total_seconds()
+        if duration > 0:
+            final_data.append({'num_images': 1, 'elapsed_time': duration})
+    return final_data
 
 # --- Main Execution ---
 
 if __name__ == "__main__":
-    if len(sys.argv) != 5:
-        print("Usage: python monitor_parse.py <tgen_log_file> <raceboat_post_log_file> <raceboat_fetch_log_file> <results_file>")
+    if len(sys.argv) != 7:
+        print("Usage: python monitor_parse.py <tgen_log> <rb_post_log> <rb_fetch_log> <app_client_log> <app_server_log> <results_json>")
         sys.exit(1)
 
-    TGEN_LOG_FILE = sys.argv[1]
-    RACEBOAT_POST_LOG_FILE = sys.argv[2]
-    RACEBOAT_FETCH_LOG_FILE = sys.argv[3]
-    OUTPUT_FILE_NAME = sys.argv[4]
+    TGEN_LOG = sys.argv[1]
+    RB_POST_LOG = sys.argv[2]
+    RB_FETCH_LOG = sys.argv[3]
+    APP_CLIENT_LOG = sys.argv[4]
+    APP_SERVER_LOG = sys.argv[5]
+    RESULTS_FILE = sys.argv[6]
 
-    log_files = [TGEN_LOG_FILE, RACEBOAT_POST_LOG_FILE, RACEBOAT_FETCH_LOG_FILE]
+    log_files = {
+        "Tgen Log": TGEN_LOG,
+        "Raceboat Post Log": RB_POST_LOG,
+        "Raceboat Fetch Log": RB_FETCH_LOG,
+        "App Client Log": APP_CLIENT_LOG,
+        "App Server Log": APP_SERVER_LOG
+    }
+
+    # Pre-flight check: Issue warnings for missing files instead of exiting
+    for name, path in log_files.items():
+        if not os.path.exists(path):
+            print(f"⚠️ WARNING: {name} not found at '{path}'. Related analyses will be skipped.")
+
+    output = {}
+
+    # 1. tgenPosting & tgenFetching
+    if os.path.exists(TGEN_LOG):
+        print(f"Analyzing {TGEN_LOG} for tgenPosting/Fetching...")
+        output['tgenPosting'] = process_and_analyze_data(parse_tgen_posting(TGEN_LOG))
+        output['tgenFetching'] = process_and_analyze_data(parse_tgen_fetching(TGEN_LOG))
+    else:
+        output['tgenPosting'] = {}
+        output['tgenFetching'] = {}
     
-    # Check if files exist
-    for f in log_files:
-        if not os.path.exists(f):
-            print(f"❌ Error: Log file not found at '{f}'.")
-            sys.exit(1)
+    # 2. raceboatPosting
+    if os.path.exists(RB_POST_LOG):
+        print(f"Analyzing {RB_POST_LOG} for raceboatPosting...")
+        output['raceboatPosting'] = process_and_analyze_data(parse_raceboat_posting(RB_POST_LOG))
+    else:
+        output['raceboatPosting'] = {}
     
-    print("--- Starting Multi-Log Analysis ---")
-    print(f"Tgen Log: {TGEN_LOG_FILE}")
-    print(f"Raceboat Post Log: {RACEBOAT_POST_LOG_FILE}")
-    print(f"Raceboat Fetch Log: {RACEBOAT_FETCH_LOG_FILE}")
-    print("-----------------------------------")
+    # 3. raceboatFetching
+    if os.path.exists(RB_FETCH_LOG):
+        print(f"Analyzing {RB_FETCH_LOG} for raceboatFetching...")
+        output['raceboatFetching'] = process_and_analyze_data(parse_raceboat_fetching(RB_FETCH_LOG))
+    else:
+        output['raceboatFetching'] = {}
 
+    # 4. iodineUpstream (Client -> Server)
+    if os.path.exists(APP_CLIENT_LOG) and os.path.exists(APP_SERVER_LOG):
+        print(f"Analyzing iodineUpstream (Client: {APP_CLIENT_LOG} -> Server: {APP_SERVER_LOG})...")
+        output['iodineUpstream'] = process_and_analyze_data(
+            parse_iodine_duration(IODINE_UPSTREAM_SEND_CMD, IODINE_UPSTREAM_RECV_CMD, APP_CLIENT_LOG, APP_SERVER_LOG),
+            include_sizes=False
+        )
+    else:
+        output['iodineUpstream'] = {}
 
-    # Run all analyses
-    final_analysis_data = run_all_analyses(
-        TGEN_LOG_FILE, 
-        RACEBOAT_POST_LOG_FILE, 
-        RACEBOAT_FETCH_LOG_FILE
-    )
+    # 5. iodineDownstream (Server -> Client)
+    if os.path.exists(APP_SERVER_LOG) and os.path.exists(APP_CLIENT_LOG):
+        print(f"Analyzing iodineDownstream (Server: {APP_SERVER_LOG} -> Client: {APP_CLIENT_LOG})...")
+        output['iodineDownstream'] = process_and_analyze_data(
+            parse_iodine_duration(IODINE_DOWNSTREAM_SEND_CMD, IODINE_DOWNSTREAM_RECV_CMD, APP_SERVER_LOG, APP_CLIENT_LOG),
+            include_sizes=False
+        )
+    else:
+        output['iodineDownstream'] = {}
 
-    # Write results to JSON file
+    # Save to JSON
     try:
-        with open(OUTPUT_FILE_NAME, 'w') as f:
-            json.dump(final_analysis_data, f, indent=4)
-        print(f"\n✨ Analysis complete! Results written to **{OUTPUT_FILE_NAME}**")
+        with open(RESULTS_FILE, 'w') as f:
+            json.dump(output, f, indent=4)
+        print(f"\n✨ Analysis complete. Consolidated results written to: {RESULTS_FILE}")
     except Exception as e:
-        print(f"\n❌ Error writing results to JSON file: {e}")
-
+        print(f"❌ Failed to write JSON results: {e}")
