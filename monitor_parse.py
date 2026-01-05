@@ -7,6 +7,7 @@ from datetime import datetime
 import re
 import os
 import sys
+import glob
 
 # --- Command Definitions (Using {log_file} placeholder) ---
 
@@ -115,66 +116,66 @@ def process_and_analyze_data(data, include_sizes=True):
 
 # --- Specific Parsing Logic ---
 
-def parse_tgen_dns(log_file):
-    """Parses resolve_a and resolve_a_batch entries from tgen dns logs."""
-    lines = execute_shell_command(TGEN_DNS_CMD, log_file)
-    parsed_data = []
-    for line in lines:
-        try:
-            clean_line = line.strip().strip('"')
-            if not clean_line: continue
-            data = json.loads(clean_line)
-            
-            # Skip "wait" type
-            if data.get("type") == "wait":
-                continue
-                
-            num_to_resolve = 0
-            if data.get("type") == "resolve_a_batch":
-                num_to_resolve = data.get("num_to_resolve", 0)
-            elif data.get("type") == "resolve_a":
-                num_to_resolve = 1
-                
-            if num_to_resolve > 0 and 'elapsed_time' in data:
-                parsed_data.append({
-                    'num_images': num_to_resolve,
+def parse_tgen_dns(log_files):
+    """Parses resolve_a and resolve_a_batch entries from multiple tgen dns logs."""
+    all_data = []
+    for log_file in log_files:
+        lines = execute_shell_command(TGEN_DNS_CMD, log_file)
+        for line in lines:
+            try:
+                clean_line = line.strip().strip('"')
+                if not clean_line: continue
+                data = json.loads(clean_line)
+                if data.get("type") == "wait": continue
+                    
+                num_to_resolve = 0
+                if data.get("type") == "resolve_a_batch":
+                    num_to_resolve = data.get("num_to_resolve", 0)
+                elif data.get("type") == "resolve_a":
+                    num_to_resolve = 1
+                    
+                if num_to_resolve > 0 and 'elapsed_time' in data:
+                    all_data.append({
+                        'num_images': num_to_resolve,
+                        'elapsed_time': data['elapsed_time']
+                    })
+            except Exception as e:
+                print(f"⚠️ ERROR (tgenDns): {e} in {log_file} on line: {line[:60]}")
+    return all_data
+
+def parse_tgen_posting(log_files):
+    all_data = []
+    for log_file in log_files:
+        lines = execute_shell_command(TGEN_POSTING_CMD, log_file)
+        for line in lines:
+            try:
+                clean_line = line.strip().strip('"')
+                if not clean_line: continue
+                data = json.loads(clean_line)
+                num_imgs = data.pop('num_to_post', data.get('num_images', 0))
+                all_data.append({
+                    'num_images': num_imgs,
+                    'elapsed_time': data['elapsed_time'],
+                    'sizes': [0] * num_imgs
+                })
+            except Exception as e:
+                print(f"⚠️ ERROR (tgenPosting): {e} in {log_file} on line: {line[:60]}")
+    return all_data
+
+def parse_tgen_fetching(log_files):
+    all_data = []
+    for log_file in log_files:
+        for json_str in execute_shell_command(MONITOR_STATS_CMD, log_file):
+            try:
+                json_payload = json_str.split('STATS=')[1].strip()
+                data = json.loads(json_payload)
+                all_data.append({
+                    'num_images': int(data['total_requests']) - 1,
                     'elapsed_time': data['elapsed_time']
                 })
-        except Exception as e:
-            print(f"⚠️ ERROR (tgenDns): {e} on line: {line[:60]}")
-    return parsed_data
-
-def parse_tgen_posting(log_file):
-    lines = execute_shell_command(TGEN_POSTING_CMD, log_file)
-    parsed_data = []
-    for line in lines:
-        try:
-            clean_line = line.strip().strip('"')
-            if not clean_line: continue
-            data = json.loads(clean_line)
-            num_imgs = data.pop('num_to_post', data.get('num_images', 0))
-            parsed_data.append({
-                'num_images': num_imgs,
-                'elapsed_time': data['elapsed_time'],
-                'sizes': [0] * num_imgs
-            })
-        except Exception as e:
-            print(f"⚠️ ERROR (tgenPosting): {e} on line: {line[:60]}")
-    return parsed_data
-
-def parse_tgen_fetching(log_file):
-    parsed_data = []
-    for json_str in execute_shell_command(MONITOR_STATS_CMD, log_file):
-        try:
-            json_payload = json_str.split('STATS=')[1].strip()
-            data = json.loads(json_payload)
-            parsed_data.append({
-                'num_images': int(data['total_requests']) - 1,
-                'elapsed_time': data['elapsed_time']
-            })
-        except Exception as e:
-            print(f"⚠️ ERROR (tgenFetching): {e} on string: {json_str[:60]}")
-    return parsed_data
+            except Exception as e:
+                print(f"⚠️ ERROR (tgenFetching): {e} in {log_file} on string: {json_str[:60]}")
+    return all_data
 
 def parse_raceboat_posting(log_file):
     enqueue_lines = execute_shell_command(RACEBOAT_POSTING_IMAGES_CMD, log_file)
@@ -284,39 +285,50 @@ def parse_iodine_duration(send_cmd, recv_cmd, send_log, recv_log):
 # --- Main Execution ---
 
 if __name__ == "__main__":
-    if len(sys.argv) != 8:
-        print("Usage: python monitor_parse.py <tgen_log> <rb_post_log> <rb_fetch_log> <app_client_log> <app_server_log> <tgen_dns_log> <results_json>")
+    if len(sys.argv) != 2:
+        print("Usage: python monitor_parse.py <root_dir>")
+        print("Note: Output will be written to 'analysis_results.json' by default.")
         sys.exit(1)
 
-    TGEN_LOG = sys.argv[1]
-    RB_POST_LOG = sys.argv[2]
-    RB_FETCH_LOG = sys.argv[3]
-    APP_CLIENT_LOG = sys.argv[4]
-    APP_SERVER_LOG = sys.argv[5]
-    TGEN_DNS_LOG = sys.argv[6]
-    RESULTS_FILE = sys.argv[7]
+    ROOT_DIR = sys.argv[1]
+    RESULTS_FILE = "analysis_results.json"
 
-    log_files = {
-        "Tgen Log": TGEN_LOG,
+    # Define assumed locations
+    RB_POST_LOG = os.path.join(ROOT_DIR, "raceboat_client.log")
+    RB_FETCH_LOG = os.path.join(ROOT_DIR, "raceboat_server.log")
+    APP_CLIENT_LOG = os.path.join(ROOT_DIR, "app_client.log")
+    APP_SERVER_LOG = os.path.join(ROOT_DIR, "app_server.log")
+    
+    # Glob patterns for multiple logs
+    DNS_GLOB = os.path.join(ROOT_DIR, "tgen_logs", "dns_client_group_*", "logs", "user*.log")
+    MASTODON_GLOB = os.path.join(ROOT_DIR, "tgen_logs", "mastodon_client_group_*", "logs", "user*.log")
+    MASTODON_MONITOR_GLOB = os.path.join(ROOT_DIR, "tgen_logs", "mastodon_monitor_client_group_*", "logs", "user*.log")
+
+    TGEN_DNS_FILES = glob.glob(DNS_GLOB)
+    TGEN_MASTODON_FILES = glob.glob(MASTODON_GLOB) + glob.glob(MASTODON_MONITOR_GLOB)
+
+    log_status = {
         "Raceboat Post Log": RB_POST_LOG,
         "Raceboat Fetch Log": RB_FETCH_LOG,
         "App Client Log": APP_CLIENT_LOG,
         "App Server Log": APP_SERVER_LOG,
-        "Tgen DNS Log": TGEN_DNS_LOG
     }
 
-    # Pre-flight check: Issue warnings for missing files instead of exiting
-    for name, path in log_files.items():
+    # Pre-flight check
+    for name, path in log_status.items():
         if not os.path.exists(path):
             print(f"⚠️ WARNING: {name} not found at '{path}'. Related analyses will be skipped.")
+    
+    print(f"🔍 Found {len(TGEN_DNS_FILES)} Tgen DNS log files.")
+    print(f"🔍 Found {len(TGEN_MASTODON_FILES)} Tgen Mastodon log files.")
 
     output = {}
 
     # 1. tgenPosting & tgenFetching
-    if os.path.exists(TGEN_LOG):
-        print(f"Analyzing {TGEN_LOG} for tgenPosting/Fetching...")
-        output['tgenPosting'] = process_and_analyze_data(parse_tgen_posting(TGEN_LOG))
-        output['tgenFetching'] = process_and_analyze_data(parse_tgen_fetching(TGEN_LOG))
+    if TGEN_MASTODON_FILES:
+        print(f"Analyzing {len(TGEN_MASTODON_FILES)} files for tgenPosting/Fetching...")
+        output['tgenPosting'] = process_and_analyze_data(parse_tgen_posting(TGEN_MASTODON_FILES))
+        output['tgenFetching'] = process_and_analyze_data(parse_tgen_fetching(TGEN_MASTODON_FILES))
     else:
         output['tgenPosting'] = {}
         output['tgenFetching'] = {}
@@ -356,9 +368,9 @@ if __name__ == "__main__":
         output['iodineDownstream'] = {}
 
     # 6. tgenDns
-    if os.path.exists(TGEN_DNS_LOG):
-        print(f"Analyzing {TGEN_DNS_LOG} for tgenDns...")
-        output['tgenDns'] = process_and_analyze_data(parse_tgen_dns(TGEN_DNS_LOG), include_sizes=False)
+    if TGEN_DNS_FILES:
+        print(f"Analyzing {len(TGEN_DNS_FILES)} files for tgenDns...")
+        output['tgenDns'] = process_and_analyze_data(parse_tgen_dns(TGEN_DNS_FILES), include_sizes=False)
     else:
         output['tgenDns'] = {}
 
