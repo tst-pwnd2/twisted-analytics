@@ -16,6 +16,7 @@ except ImportError:
 # --- Command Definitions ---
 
 TGEN_POSTING_CMD = "grep \"STATS.*num_to_post\" {log_file} | cut -d'=' -f2"
+TGEN_FETCHING_CMD = "grep \"STATS.*monitor_download\" {log_file} | cut -d'=' -f2"
 MONITOR_STATS_CMD = "grep 'STATS.*download' {log_file} | cut -d' ' -f4-"
 
 RACEBOAT_POSTING_IMAGES_CMD = "grep \"PluginMastodon::enqueueContent: called with params.linkId\" {log_file} | cut -d' ' -f10,11,12"
@@ -405,8 +406,36 @@ def parse_tgen_posting(log_files):
                     sizes = [0] * num_imgs
 
                 all_data.append({
-                    'start_ts': data['timestamp'],
-                    'stop_ts': data['timestamp'] + data['elapsed_time'],
+                    'num_images': num_imgs,
+                    'elapsed_time': data['elapsed_time'],
+                    'sizes': sizes
+                })
+            except Exception:
+                continue
+    return all_data
+
+def parse_tgen_fetching(log_files):
+    """Parses monitor_download entries and downloaded_images_response sizes from multiple tgen logs."""
+    all_data = []
+    for log_file in log_files:
+        lines = execute_shell_command(TGEN_FETCHING_CMD, log_file)
+        for line in lines:
+            try:
+                clean_line = line.strip().strip('"')
+                if not clean_line: continue
+                data = json.loads(clean_line)
+                
+                # Extract sizes from downloaded_images_response array
+                sizes = []
+                if "downloaded_images_response" in data and isinstance(data["downloaded_images_response"], list):
+                    for entry in data["downloaded_images_response"]:
+                        if "content_len" in entry:
+                            sizes.append(entry["content_len"])
+                
+                # For fetching, num_images is based on the length of the responses
+                num_imgs = len(sizes)
+
+                all_data.append({
                     'num_images': num_imgs,
                     'elapsed_time': data['elapsed_time'],
                     'sizes': sizes
@@ -472,7 +501,6 @@ def parse_iodine_duration(send_cmd, recv_cmd, send_log, recv_log, direction):
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: python monitor_parse.py <root_dir>")
-        # Default root if testing locally without arguments
         ROOT_DIR = "."
     else:
         ROOT_DIR = sys.argv[1]
@@ -529,11 +557,13 @@ if __name__ == "__main__":
     dns_files = glob.glob(os.path.join(ROOT_DIR, "tgen_logs", "dns_client_group_*", "logs", "user*.log"))
     output['tgenDns'] = process_and_analyze_data(parse_tgen_dns(dns_files), include_sizes=False)
     
-    # --- 6. Tgen Posting ---
+    # --- 6. Tgen Posting/Fetching ---
     if TGEN_MASTODON_FILES:
         output['tgenPosting'] = process_and_analyze_data(parse_tgen_posting(TGEN_MASTODON_FILES))
+        output['tgenFetching'] = process_and_analyze_data(parse_tgen_fetching(TGEN_MASTODON_FILES))
     else:
         output['tgenPosting'] = {}
+        output['tgenFetching'] = {}
 
     # --- 7. Iodine DNS Activity Comparison ---
     output['dns_activity_comparison'] = analyze_iodine_dns_activity(
