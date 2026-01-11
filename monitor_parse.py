@@ -23,6 +23,11 @@ RACEBOAT_POSTING_IMAGES_CMD = "grep \"PluginMastodon::enqueueContent: called wit
 RACEBOAT_POSTING_START_CMD = "grep \"Raceboat::TransportComponentWrapper::doAction: called with handlesJson\" {log_file} | cut -d' ' -f1,2,11"
 RACEBOAT_POSTING_STOP_CMD = "grep \"PluginCommsTwoSixStubUserModelReactiveFile::onTransportEvent: called with event.json\" {log_file} | cut -d' ' -f1,2"
 
+# Detailed Raceboat Posting Commands
+RACEBOAT_DETAILED_IMAGE_CMD = "grep \"MastodonClient::postStatus: posting image\" {log_file}"
+RACEBOAT_DETAILED_STATUS_CMD = "grep \"MastodonClient::postStatus: status URL\" {log_file}"
+RACEBOAT_DETAILED_END_CMD = "grep \"Raceboat::ComponentManager::onEvent: called with event=Event{{}}\" {log_file}"
+
 # Reverted to multiple grep commands for fetching
 RACEBOAT_FETCHING_START_CMD = "grep \"PluginMastodon::doAction: Fetching from single link\" {log_file} | cut -d' ' -f1,2"
 RACEBOAT_FETCHING_END_CMD = "grep \"Link::fetch: Fetched [0-9]\\+ items\" {log_file} | cut -d' ' -f1,2,7,8,9"
@@ -125,6 +130,7 @@ def process_and_analyze_data(data, include_sizes=True):
             'stop_ts': item.get('stop_ts')
         }
         if 'direction' in item: entry['direction'] = item['direction']
+        if 'operations' in item: entry['operations'] = item['operations']
         if include_sizes: entry['sizes'] = item.get('sizes', [0])
         if 'zeekSizes' in item: entry['zeekSizes'] = item['zeekSizes']
         grouped_times[num_imgs].append(entry)
@@ -367,6 +373,93 @@ def parse_raceboat_posting(log_file):
         if stop > event['start_ts']: final_data.append({**event, 'stop_ts': stop, 'elapsed_time': stop - event['start_ts']})
     return final_data
 
+def parse_detailed_raceboat_posting(log_file):
+    """
+    Parses detailed posting events including individual image and status timings.
+    Uses thread IDs to group sequential operations.
+    """
+    image_lines = execute_shell_command(RACEBOAT_DETAILED_IMAGE_CMD, log_file)
+    status_lines = execute_shell_command(RACEBOAT_DETAILED_STATUS_CMD, log_file)
+    end_lines = execute_shell_command(RACEBOAT_DETAILED_END_CMD, log_file)
+
+    # Collect all lines with type and thread context
+    all_ops = []
+    for label, lines in [('image', image_lines), ('status', status_lines), ('end', end_lines)]:
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 3: continue
+            
+            ts_raw = " ".join(parts[:2])
+            ts = get_utc_timestamp(ts_raw)
+            thread_match = re.search(r'thread=([0-9a-f]+)', line)
+            
+            if ts and thread_match:
+                all_ops.append({
+                    'ts': ts,
+                    'thread': thread_match.group(1),
+                    'type': label
+                })
+
+    all_ops.sort(key=lambda x: x['ts'])
+
+    # Group by thread to handle concurrency
+    thread_groups = defaultdict(list)
+    for op in all_ops:
+        thread_groups[op['thread']].append(op)
+
+    final_events = []
+    for thread, ops in thread_groups.items():
+        event = None
+        for i, op in enumerate(ops):
+            if op['type'] == 'image':
+                # Start of a potential new posting event if we aren't in one
+                if event is None:
+                    event = {
+                        'start_ts': op['ts'],
+                        'ops_queue': [op],
+                        'num_images': 0
+                    }
+                else:
+                    event['ops_queue'].append(op)
+            
+            elif op['type'] == 'status' and event:
+                event['ops_queue'].append(op)
+                
+            elif op['type'] == 'end' and event:
+                # Close the event
+                start = event['start_ts']
+                stop = op['ts']
+                q = event['ops_queue']
+                
+                detailed_ops = []
+                image_count = 0
+                
+                # Calculate segments: Img1->Img2, Img2->Status, Status->End
+                for j in range(len(q)):
+                    seg_start = q[j]['ts']
+                    # End of segment is start of next op OR the final 'end' ts
+                    seg_stop = q[j+1]['ts'] if j+1 < len(q) else stop
+                    
+                    duration = seg_stop - seg_start
+                    detailed_ops.append({
+                        'type': q[j]['type'],
+                        'duration': duration,
+                        'order': j
+                    })
+                    if q[j]['type'] == 'image':
+                        image_count += 1
+
+                final_events.append({
+                    'num_images': image_count,
+                    'start_ts': start,
+                    'stop_ts': stop,
+                    'elapsed_time': stop - start,
+                    'operations': detailed_ops
+                })
+                event = None
+
+    return final_events
+
 def parse_raceboat_fetching(log_file):
     """
     Parses Raceboat fetching events using separate greps.
@@ -423,7 +516,7 @@ def parse_iodine_duration(send_cmd, recv_cmd, send_log, recv_log, direction):
     sends, recvs = execute_shell_command(send_cmd, send_log), execute_shell_command(recv_cmd, recv_log)
     st = [t for t in [get_utc_timestamp(s) for s in sends] if t]
     rt = [t for t in [get_utc_timestamp(r) for r in recvs] if t]
-    return [{'num_images': 1, 'elapsed_time': r - s, 'start_ts': s, 'stop_ts': r, 'direction': direction, 'sizes': [1] if direction == 'downstream' else [0]} for s, r in zip(st, rt) if r > s]
+    return [{'num_images': 1, 'elapsed_time': r - s, 'start_ts': s, 'stop_ts': r, 'direction': direction} for s, r in zip(st, rt) if r > s]
 
 # --- Main Execution ---
 
@@ -444,14 +537,18 @@ if __name__ == "__main__":
 
     # Iodine Analyses
     up_data = parse_iodine_duration(IODINE_UPSTREAM_SEND_CMD, IODINE_UPSTREAM_RECV_CMD, APP_CLIENT_LOG, APP_SERVER_LOG, "upstream")
-    output['iodineUpstream'] = process_and_analyze_data(correlate_zeek_to_events(up_data, zeek_pre, apre, "10.20.1.5", "DNS_"), True)
+    output['iodineUpstream'] = process_and_analyze_data(correlate_zeek_to_events(up_data, zeek_pre, apre, "10.20.1.5", "DNS_"), False)
     
     down_data = parse_iodine_duration(IODINE_DOWNSTREAM_SEND_CMD, IODINE_DOWNSTREAM_RECV_CMD, APP_SERVER_LOG, APP_CLIENT_LOG, "downstream")
-    output['iodineDownstream'] = process_and_analyze_data(correlate_zeek_to_events(down_data, zeek_post, apost, "10.20.0.3", "DNS_"), True)
+    output['iodineDownstream'] = process_and_analyze_data(correlate_zeek_to_events(down_data, zeek_post, apost, "10.20.0.3", "DNS_"), False)
 
     # Raceboat Analyses
     output['raceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(parse_raceboat_posting(RB_POST_LOG), zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
     output['raceboatFetching'] = process_and_analyze_data(correlate_zeek_to_events(parse_raceboat_fetching(RB_FETCH_LOG), zeek_post, apost, "10.20.0.3", "HTTPS_", True))
+
+    # Detailed Raceboat Posting Analysis
+    detailed_rb_post = parse_detailed_raceboat_posting(RB_POST_LOG)
+    output['detailedRaceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(detailed_rb_post, zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
 
     # Other Metrics
     output['unassigned_zeek_metrics'] = {'pre_nat': get_unassigned_zeek_stats(zeek_pre, apre, "10.20.1.5"), 'post_nat': get_unassigned_zeek_stats(zeek_post, apost, "10.20.0.3")}
