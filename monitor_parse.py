@@ -305,6 +305,7 @@ def parse_scenario_metadata(root_dir):
         app_cfg = cfg.get('application', {})
         metadata['iodine_config'] = app_cfg.get('iodine', {})
         metadata['raceboat_config'] = {'alice_prof_config': app_cfg.get('alice', {}).get('raceboat_prof_config'), 'bob_prof_config': app_cfg.get('bob', {}).get('raceboat_prof_config')}
+        metadata['test_id'] = cfg.get('testing', {}).get('test_id', '')
     except Exception: pass
     return metadata
 
