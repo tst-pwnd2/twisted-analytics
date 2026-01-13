@@ -319,7 +319,16 @@ def parse_tgen_dns(log_files):
                 data = json.loads(line.strip().strip('"'))
                 if data.get("type") == "wait": continue
                 num = data.get("num_to_resolve", 1) if data.get("type") == "resolve_a_batch" else 1
-                if 'elapsed_time' in data: all_data.append({'num_images': num, 'elapsed_time': data['elapsed_time']})
+                if 'elapsed_time' in data:
+                    stop_ts = data.get('timestamp')
+                    elapsed = data.get('elapsed_time', 0)
+                    start_ts = stop_ts - elapsed if stop_ts else None
+                    all_data.append({
+                        'num_images': num, 
+                        'elapsed_time': elapsed,
+                        'start_ts': start_ts,
+                        'stop_ts': stop_ts
+                    })
             except Exception: continue
     return all_data
 
@@ -332,7 +341,18 @@ def parse_tgen_posting(log_files):
                 sizes = [e["request_est_size"] for e in data.get("media_post", []) if "request_est_size" in e]
                 num_imgs = data.get('num_to_post', data.get('num_images', len(sizes)))
                 if not sizes and num_imgs > 0: sizes = [0] * num_imgs
-                all_data.append({'num_images': num_imgs, 'elapsed_time': data['elapsed_time'], 'sizes': sizes})
+                
+                stop_ts = data.get('timestamp')
+                elapsed = data.get('elapsed_time', 0)
+                start_ts = stop_ts - elapsed if stop_ts else None
+                
+                all_data.append({
+                    'num_images': num_imgs, 
+                    'elapsed_time': elapsed, 
+                    'sizes': sizes,
+                    'start_ts': start_ts,
+                    'stop_ts': stop_ts
+                })
             except Exception: continue
     return all_data
 
@@ -343,7 +363,18 @@ def parse_tgen_fetching(log_files):
             try:
                 data = json.loads(line.strip().strip('"'))
                 sizes = [e["content_len"] for e in data.get("downloaded_images_response", []) if "content_len" in e]
-                all_data.append({'num_images': len(sizes), 'elapsed_time': data['elapsed_time'], 'sizes': sizes})
+                
+                stop_ts = data.get('timestamp')
+                elapsed = data.get('elapsed_time', 0)
+                start_ts = stop_ts - elapsed if stop_ts else None
+                
+                all_data.append({
+                    'num_images': len(sizes), 
+                    'elapsed_time': elapsed, 
+                    'sizes': sizes,
+                    'start_ts': start_ts,
+                    'stop_ts': stop_ts
+                })
             except Exception: continue
     return all_data
 
@@ -374,91 +405,85 @@ def parse_raceboat_posting(log_file):
         if stop > event['start_ts']: final_data.append({**event, 'stop_ts': stop, 'elapsed_time': stop - event['start_ts']})
     return final_data
 
-def parse_detailed_raceboat_posting(log_file):
+def parse_detailed_raceboat_posting(log_file, base_events):
     """
-    Parses detailed posting events including individual image and status timings.
-    Uses thread IDs to group sequential operations.
+    Parses detailed posting events and tracks Sizes for operations.
+    Matches image sizes from standard base_events and sets status size to 165.
     """
     image_lines = execute_shell_command(RACEBOAT_DETAILED_IMAGE_CMD, log_file)
     status_lines = execute_shell_command(RACEBOAT_DETAILED_STATUS_CMD, log_file)
     end_lines = execute_shell_command(RACEBOAT_DETAILED_END_CMD, log_file)
 
-    # Collect all lines with type and thread context
     all_ops = []
     for label, lines in [('image', image_lines), ('status', status_lines), ('end', end_lines)]:
         for line in lines:
             parts = line.split()
             if len(parts) < 3: continue
-            
             ts_raw = " ".join(parts[:2])
             ts = get_utc_timestamp(ts_raw)
             thread_match = re.search(r'thread=([0-9a-f]+)', line)
-            
             if ts and thread_match:
-                all_ops.append({
-                    'ts': ts,
-                    'thread': thread_match.group(1),
-                    'type': label
-                })
+                all_ops.append({'ts': ts, 'thread': thread_match.group(1), 'type': label})
 
     all_ops.sort(key=lambda x: x['ts'])
-
-    # Group by thread to handle concurrency
     thread_groups = defaultdict(list)
-    for op in all_ops:
-        thread_groups[op['thread']].append(op)
+    for op in all_ops: thread_groups[op['thread']].append(op)
 
     final_events = []
     for thread, ops in thread_groups.items():
         event = None
         for i, op in enumerate(ops):
             if op['type'] == 'image':
-                # Start of a potential new posting event if we aren't in one
                 if event is None:
-                    event = {
-                        'start_ts': op['ts'],
-                        'ops_queue': [op],
-                        'num_images': 0
-                    }
+                    event = {'start_ts': op['ts'], 'ops_queue': [op]}
                 else:
                     event['ops_queue'].append(op)
-            
             elif op['type'] == 'status' and event:
                 event['ops_queue'].append(op)
-                
             elif op['type'] == 'end' and event:
-                # Close the event
-                start = event['start_ts']
-                stop = op['ts']
-                q = event['ops_queue']
+                start, stop, q = event['start_ts'], op['ts'], event['ops_queue']
+                
+                # Find matching non-detailed event to pull sizes
+                base_match = min(base_events, key=lambda x: abs(x['start_ts'] - start))
+                is_valid_match = abs(base_match['start_ts'] - start) < 1.0
                 
                 detailed_ops = []
+                image_idx = 0
                 image_count = 0
+                sizes_captured = []
                 
-                # Calculate segments: Img1->Img2, Img2->Status, Status->End
                 for j in range(len(q)):
                     seg_start = q[j]['ts']
-                    # End of segment is start of next op OR the final 'end' ts
                     seg_stop = q[j+1]['ts'] if j+1 < len(q) else stop
+                    op_type = q[j]['type']
                     
-                    duration = seg_stop - seg_start
+                    # Size logic
+                    op_size = 0
+                    if op_type == 'image':
+                        image_count += 1
+                        if is_valid_match and image_idx < len(base_match['sizes']):
+                            op_size = base_match['sizes'][image_idx]
+                            image_idx += 1
+                    elif op_type == 'status':
+                        op_size = 165
+                    
+                    sizes_captured.append(op_size)
                     detailed_ops.append({
-                        'type': q[j]['type'],
-                        'duration': duration,
+                        'type': op_type,
+                        'duration': seg_stop - seg_start,
+                        'size': op_size,
                         'order': j
                     })
-                    if q[j]['type'] == 'image':
-                        image_count += 1
 
                 final_events.append({
                     'num_images': image_count,
                     'start_ts': start,
                     'stop_ts': stop,
                     'elapsed_time': stop - start,
+                    'sizes': sizes_captured,
                     'operations': detailed_ops
                 })
                 event = None
-
     return final_events
 
 def parse_raceboat_fetching(log_file):
@@ -472,7 +497,6 @@ def parse_raceboat_fetching(log_file):
     each_entries = execute_shell_command(RACEBOAT_FETCHING_EACH_CMD, log_file)
 
     parsed_starts = sorted([t for t in [get_utc_timestamp(s) for s in starts] if t])
-    
     parsed_ends = []
     for line in ends:
         ts, count = extract_ts_and_last_int(line)
@@ -488,21 +512,13 @@ def parse_raceboat_fetching(log_file):
     parsed_each.sort(key=lambda x: x['ts'])
 
     final_data = []
-    # Match each start with the next occurring end marker for duration/count,
-    # but use the window until the *next* START to gather individual 'each' content sizes.
     for i, start in enumerate(parsed_starts):
-        # The summary 'end' line for this specific fetch
         matching_end = next((e for e in parsed_ends if e['ts'] > start), None)
-        
-        # The window for gathering 'each' sizes extends until the next start
         next_start_limit = parsed_starts[i+1] if i + 1 < len(parsed_starts) else float('inf')
         
         if matching_end:
             stop = matching_end['ts']
-            # Find individual content fetches that occurred between this start and the next start limit
-            # (as 'each' logs often trail behind the summary 'end' log)
             sizes = [e['size'] for e in parsed_each if start <= e['ts'] < next_start_limit]
-            
             final_data.append({
                 'num_images': matching_end['count'],
                 'elapsed_time': stop - start,
@@ -510,7 +526,6 @@ def parse_raceboat_fetching(log_file):
                 'stop_ts': stop,
                 'sizes': sizes
             })
-            
     return final_data
 
 def parse_iodine_duration(send_cmd, recv_cmd, send_log, recv_log, direction):
@@ -544,11 +559,12 @@ if __name__ == "__main__":
     output['iodineDownstream'] = process_and_analyze_data(correlate_zeek_to_events(down_data, zeek_post, apost, "10.20.0.3", "DNS_"), False)
 
     # Raceboat Analyses
-    output['raceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(parse_raceboat_posting(RB_POST_LOG), zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
+    rb_post_base = parse_raceboat_posting(RB_POST_LOG)
+    output['raceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(rb_post_base, zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
     output['raceboatFetching'] = process_and_analyze_data(correlate_zeek_to_events(parse_raceboat_fetching(RB_FETCH_LOG), zeek_post, apost, "10.20.0.3", "HTTPS_", True))
 
-    # Detailed Raceboat Posting Analysis
-    detailed_rb_post = parse_detailed_raceboat_posting(RB_POST_LOG)
+    # Detailed Raceboat Posting Analysis - passed standard events for size correlation
+    detailed_rb_post = parse_detailed_raceboat_posting(RB_POST_LOG, rb_post_base)
     output['detailedRaceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(detailed_rb_post, zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
 
     # Other Metrics
