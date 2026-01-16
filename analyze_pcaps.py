@@ -191,35 +191,45 @@ def assign_http_packets_to_events(
         if packet.haslayer("TCP") and (
             packet["TCP"].dport in HTTP_PORTS or packet["TCP"].sport in HTTP_PORTS
         ):
+            packet_data = {
+                "description": str(packet.getlayer(0)),
+                "time": float(packet.time),
+                "sizes": {l.__name__: len(packet[l]) for l in packet.layers()},
+                "srcIp": packet["IP"].src,
+                "srcPort": packet["TCP"].sport,
+                "destIp": packet["IP"].dst,
+                "destPort": packet["TCP"].dport,
+                "direction": (
+                    "client-to-server"
+                    if packet["TCP"].dport in HTTP_PORTS
+                    else "server-to-client"
+                ),
+                "flags": [TCP_FLAGS[f] for f in str(packet["TCP"].flags)],
+            }
+
+            last_event = None
             for idx in range(last_event_idx, len(events)):
                 event = events[idx]
                 if event[start_key] <= packet.time and packet.time < event[stop_key]:
-                    event["packets"].append(
-                        {
-                            "description": str(packet.getlayer(0)),
-                            "time": float(packet.time),
-                            "sizes": {
-                                l.__name__: len(packet[l]) for l in packet.layers()
-                            },
-                            "srcIp": packet["IP"].src,
-                            "srcPort": packet["TCP"].sport,
-                            "destIp": packet["IP"].dst,
-                            "destPort": packet["TCP"].dport,
-                            "direction": (
-                                "client-to-server"
-                                if packet["TCP"].dport in HTTP_PORTS
-                                else "server-to-client"
-                            ),
-                            "flags": [TCP_FLAGS[f] for f in str(packet["TCP"].flags)],
-                        }
-                    )
+                    event["packets"].append(packet_data)
                     # last_event_idx = idx
                     break
+                if (
+                    last_event
+                    and last_event[stop_key] < packet.time
+                    and packet.time < event[start_key]
+                ):
+                    last_event["packets"].append(packet_data)
+                    break
+                last_event = event
             else:
-                click.echo(
-                    f"Unable to find event for packet {packet.getlayer(0)} @ {packet.time}",
-                    err=True,
-                )
+                if last_event and last_event[stop_key] < packet.time:
+                    last_event["packets"].append(packet_data)
+                else:
+                    click.echo(
+                        f"Unable to find event for packet {packet.getlayer(0)} @ {packet.time}",
+                        err=True,
+                    )
 
 
 def sort_packets_in_events(events: list[dict]):
@@ -337,16 +347,16 @@ def raceboat(pcapfile: str, eventsfile: str, out: str):
     with open(eventsfile, "r", encoding="UTF-8") as infile:
         eventsdata: dict = json.load(infile)
 
-    sparse_events = []
-    sparse_events.extend(
+    events = []
+    events.extend(
         parse_events(
             eventsdata, "detailedRaceboatPosting.*.data", "raceboat", "upstream"
         )
     )
-    sparse_events.extend(
+    events.extend(
         parse_events(eventsdata, "raceboatFetching.*.data", "raceboat", "downstream")
     )
-    events = create_continuous_event_timeline(sparse_events)
+    events.sort(key=lambda e: e["start_ts"])
 
     packets = rdpcap(pcapfile)
     assign_dns_packets_to_events(events, packets, domain="mastodon.pwnd.com")
