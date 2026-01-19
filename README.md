@@ -72,3 +72,21 @@ python analyze_pcaps.py raceboat-fetch \
 ```
 
 Produces `raceboat_fetch_events_and_packets.json` as output.
+
+### Iodine poll rates
+
+```sh
+python analyze_iodine.py poll-rate <packetsfile>
+```
+
+Using the output from [Iodine traffic](#iodine-traffic), calculates the average
+rate of iodine queries made during each event, as well as a rolling (10-query,
+by default) average.
+
+For example,
+
+```sh
+python analyze_iodine.py poll-rate iodine_events_and_packets.json
+```
+
+Produces `iodine_event_poll_rates.json` as output.
