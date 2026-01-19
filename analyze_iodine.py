@@ -121,9 +121,11 @@ def poll_rate(packetsfile: str, out: str, rolling_count: int):
         if event["eventType"] == "idle" and first_idle:
             first_idle = False
             continue
-        avgs_by_event_type[
-            f'{event["eventType"]}-{event.get("direction", "na")}'
-        ].append(event_avg_rate)
+
+        if event_avg_rate > 0:
+            avgs_by_event_type[
+                f'{event["eventType"]}-{event.get("direction", "na")}'
+            ].append(event_avg_rate)
 
     results = dict(
         events=event_results,

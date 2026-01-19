@@ -329,7 +329,11 @@ def iodine(pcapfile: str, eventsfile: str, out: str):
     assign_dns_packets_to_events(events, packets)
 
     with open(out, "w", encoding="UTF-8") as outfile:
-        json.dump(events, outfile, indent=2, default=str)
+        # explicitly ignore the leading idle because it captures handshake data
+        if events[0]['eventType'] == 'idle':
+            events = events[1:]
+            
+        json.dump(events, outfile, indent=2, default=str) 
 
 
 @analyze.command()
