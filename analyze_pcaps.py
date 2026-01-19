@@ -337,24 +337,18 @@ def iodine(pcapfile: str, eventsfile: str, out: str):
 @click.argument("eventsfile")
 @click.option(
     "--out",
-    default="raceboat_events_and_packets.json",
+    default="raceboat_post_events_and_packets.json",
     help="JSON file to which to write results",
 )
-def raceboat(pcapfile: str, eventsfile: str, out: str):
+def raceboat_post(pcapfile: str, eventsfile: str, out: str):
     """
     Parse PCAPFILE to attach packets to network events from EVENTSFILE.
     """
     with open(eventsfile, "r", encoding="UTF-8") as infile:
         eventsdata: dict = json.load(infile)
 
-    events = []
-    events.extend(
-        parse_events(
-            eventsdata, "detailedRaceboatPosting.*.data", "raceboat", "upstream"
-        )
-    )
-    events.extend(
-        parse_events(eventsdata, "raceboatFetching.*.data", "raceboat", "downstream")
+    events = parse_events(
+        eventsdata, "detailedRaceboatPosting.*.data", "raceboat", "upstream"
     )
     events.sort(key=lambda e: e["start_ts"])
 
@@ -363,6 +357,34 @@ def raceboat(pcapfile: str, eventsfile: str, out: str):
     assign_http_packets_to_events(events, packets)
     sort_packets_in_events(events)
     assign_packets_to_post_operations(events)
+
+    with open(out, "w", encoding="UTF-8") as outfile:
+        json.dump(events, outfile, indent=2, default=str)
+
+
+@analyze.command()
+@click.argument("pcapfile")
+@click.argument("eventsfile")
+@click.option(
+    "--out",
+    default="raceboat_fetch_events_and_packets.json",
+    help="JSON file to which to write results",
+)
+def raceboat_fetch(pcapfile: str, eventsfile: str, out: str):
+    """
+    Parse PCAPFILE to attach packets to network events from EVENTSFILE.
+    """
+    with open(eventsfile, "r", encoding="UTF-8") as infile:
+        eventsdata: dict = json.load(infile)
+
+    events = create_continuous_event_timeline(
+        parse_events(eventsdata, "raceboatFetching.*.data", "raceboat", "downstream")
+    )
+
+    packets = rdpcap(pcapfile)
+    assign_dns_packets_to_events(events, packets, domain="mastodon.pwnd.com")
+    assign_http_packets_to_events(events, packets)
+    sort_packets_in_events(events)
 
     with open(out, "w", encoding="UTF-8") as outfile:
         json.dump(events, outfile, indent=2, default=str)
