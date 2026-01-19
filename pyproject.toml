@@ -1,0 +1,14 @@
+[project]
+name = "twisted-analytics"
+version = "0.1.0"
+description = "Analytics tools for the TWISTED team"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.3.1",
+    "jsonpath-ng>=1.7.0",
+    "numpy>=2.4.1",
+    "pyyaml>=6.0.3",
+    "scapy>=2.7.0",
+    "scipy>=1.17.0",
+]
