@@ -2,7 +2,7 @@ import subprocess
 import json
 from collections import defaultdict
 import numpy as np
-from scipy.stats import wasserstein_distance
+from scipy.stats import norm, wasserstein_distance
 from datetime import datetime, timezone
 import re
 import os
@@ -153,6 +153,45 @@ def process_and_analyze_data(data, include_sizes=True):
             'data': group_data
         }
     return analysis_results
+
+def generate_event_models(output_data):
+    """
+    Fits Gaussian models to aggregated latencies for each event type.
+    For raceboatPosting, fits separate models for image counts 1-4.
+    """
+    fitted_models = {}
+
+    # 1. Raceboat Posting (Specific 1-4 requirement)
+    if 'raceboatPosting' in output_data:
+        rp_fits = {}
+        for n in ["1", "2", "3", "4"]:
+            if n in output_data['raceboatPosting']:
+                durations = [item['duration'] for item in output_data['raceboatPosting'][n]['data']]
+                if len(durations) >= 2:
+                    mu, std = norm.fit(durations)
+                    rp_fits[n] = {'loc': float(mu), 'scale': float(std)}
+        if rp_fits:
+            fitted_models['raceboatPosting'] = rp_fits
+
+    # 2. Other Event Types (Aggregate across all groups)
+    event_categories = [
+        'iodineUpstream', 'iodineDownstream', 'raceboatFetching', 
+        'tgenPosting', 'tgenFetching', 'tgenDns'
+    ]
+    
+    for cat in event_categories:
+        if cat not in output_data:
+            continue
+        
+        all_durations = []
+        for subgroup in output_data[cat].values():
+            all_durations.extend([item['duration'] for item in subgroup['data']])
+        
+        if len(all_durations) >= 2:
+            mu, std = norm.fit(all_durations)
+            fitted_models[cat] = {'loc': float(mu), 'scale': float(std)}
+
+    return fitted_models
 
 # --- Zeek Logic ---
 
@@ -551,6 +590,8 @@ if __name__ == "__main__":
     output['zeek_metrics'] = {'pre_nat': zeek_pre, 'post_nat': zeek_post}
     apre, apost = set(), set()
 
+    # --- Data Collection for Analysis and Timeline ---
+    
     # Iodine Analyses
     up_data = parse_iodine_duration(IODINE_UPSTREAM_SEND_CMD, IODINE_UPSTREAM_RECV_CMD, APP_CLIENT_LOG, APP_SERVER_LOG, "upstream")
     output['iodineUpstream'] = process_and_analyze_data(correlate_zeek_to_events(up_data, zeek_pre, apre, "10.20.1.5", "DNS_"), False)
@@ -561,17 +602,75 @@ if __name__ == "__main__":
     # Raceboat Analyses
     rb_post_base = parse_raceboat_posting(RB_POST_LOG)
     output['raceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(rb_post_base, zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
-    output['raceboatFetching'] = process_and_analyze_data(correlate_zeek_to_events(parse_raceboat_fetching(RB_FETCH_LOG), zeek_post, apost, "10.20.0.3", "HTTPS_", True))
+    
+    rb_fetch_data = parse_raceboat_fetching(RB_FETCH_LOG)
+    output['raceboatFetching'] = process_and_analyze_data(correlate_zeek_to_events(rb_fetch_data, zeek_post, apost, "10.20.0.3", "HTTPS_", True))
 
-    # Detailed Raceboat Posting Analysis - passed standard events for size correlation
+    # Detailed Raceboat Posting Analysis
     detailed_rb_post = parse_detailed_raceboat_posting(RB_POST_LOG, rb_post_base)
     output['detailedRaceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(detailed_rb_post, zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
 
-    # Other Metrics
+    # Tgen Metrics
+    tgen_dns_data = parse_tgen_dns(glob.glob(os.path.join(ROOT_DIR, "tgen_logs", "dns_client_group_*", "logs", "user*.log")))
+    output['tgenDns'] = process_and_analyze_data(tgen_dns_data, False)
+    
+    tgen_post_data = parse_tgen_posting(TGEN_MASTODON_FILES)
+    output['tgenPosting'] = process_and_analyze_data(tgen_post_data)
+    
+    tgen_fetch_data = parse_tgen_fetching(TGEN_MASTODON_FILES)
+    output['tgenFetching'] = process_and_analyze_data(tgen_fetch_data)
+
+    # --- Chronological Event Timeline Generation ---
+    
+    raw_timeline = []
+    event_sources = [
+        (up_data, 'iodineUpstream'),
+        (down_data, 'iodineDownstream'),
+        (rb_post_base, 'raceboatPosting'),
+        (rb_fetch_data, 'raceboatFetching'),
+        (detailed_rb_post, 'detailedRaceboatPosting'),
+        (tgen_dns_data, 'tgenDns'),
+        (tgen_post_data, 'tgenPosting'),
+        (tgen_fetch_data, 'tgenFetching')
+    ]
+    
+    for source_list, event_type in event_sources:
+        for event in source_list:
+            if 'start_ts' in event and 'stop_ts' in event:
+                raw_timeline.append({
+                    'type': event_type,
+                    'start_ts': event['start_ts'],
+                    'stop_ts': event['stop_ts']
+                })
+    
+    # Trim logic: start at first iodineUpstream, end at last iodineDownstream
+    upstream_starts = [e['start_ts'] for e in up_data if 'start_ts' in e]
+    downstream_stops = [e['stop_ts'] for e in down_data if 'stop_ts' in e]
+    
+    if upstream_starts and downstream_stops:
+        ref_start = min(upstream_starts)
+        ref_stop = max(downstream_stops)
+        
+        trimmed_timeline = []
+        for event in raw_timeline:
+            # Keep events that occur (even partially) within the ref window
+            # but standard interpretation is usually based on start_ts being within window
+            if event['start_ts'] >= ref_start and event['stop_ts'] <= ref_stop:
+                event['relative_start_ts'] = event['start_ts'] - ref_start
+                event['relative_stop_ts'] = event['stop_ts'] - ref_start
+                trimmed_timeline.append(event)
+        
+        trimmed_timeline.sort(key=lambda x: x['start_ts'])
+        output['event_timeline'] = trimmed_timeline
+    else:
+        output['event_timeline'] = []
+
+    # --- Remaining Metrics ---
     output['unassigned_zeek_metrics'] = {'pre_nat': get_unassigned_zeek_stats(zeek_pre, apre, "10.20.1.5"), 'post_nat': get_unassigned_zeek_stats(zeek_post, apost, "10.20.0.3")}
-    output['tgenDns'] = process_and_analyze_data(parse_tgen_dns(glob.glob(os.path.join(ROOT_DIR, "tgen_logs", "dns_client_group_*", "logs", "user*.log"))), False)
-    output['tgenPosting'], output['tgenFetching'] = process_and_analyze_data(parse_tgen_posting(TGEN_MASTODON_FILES)), process_and_analyze_data(parse_tgen_fetching(TGEN_MASTODON_FILES))
     output['dns_activity_comparison'] = analyze_iodine_dns_activity(up_data, down_data, zeek_pre, "10.20.1.5")
+
+    # Final Summary Gaussian Models
+    output['event_gaussian_models'] = generate_event_models(output)
 
     with open(RESULTS_FILE, 'w') as f:
         json.dump(output, f, indent=4, default=str)
