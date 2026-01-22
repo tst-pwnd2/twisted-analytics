@@ -33,13 +33,8 @@ RACEBOAT_FETCHING_START_CMD = "grep \"PluginMastodon::doAction: Fetching from si
 RACEBOAT_FETCHING_END_CMD = "grep \"Link::fetch: Fetched [0-9]\\+ items\" {log_file} | cut -d' ' -f1,2,7,8,9"
 RACEBOAT_FETCHING_EACH_CMD = "grep \"Link::fetch: Fetched image content\" {log_file} | cut -d' ' -f1,2,10,11,12"
 
-# Detailed decode bytes commands
-RACEBOAT_DETAILED_DECODE_START_CMD = "grep \"Raceboat::EncodingComponentWrapper::decodeBytes: called with handle\" {log_file}"
-RACEBOAT_DETAILED_DECODE_END_CMD = "grep \"Raceboat::ComponentReceivePackageManager::onBytesDecoded: called with postId\" {log_file}"
-
-# Decode bytes commands
-RACEBOAT_DECODE_START_CMD = "grep \"Link::fetch: Fetched [0-9]\\+ items for hashtag\" {log_file}"
-RACEBOAT_DECODE_END_CMD = "grep \"Raceboat::ApiManager::receiveEncPkg: Calling postId:\" {log_file}"
+# CURL Data Analysis Command
+RACEBOAT_CURL_DATA_CMD = "grep -E \"CURL DATA IN|CURL DATA OUT\" {log_file}"
 
 # Iodine logs use spaces to separate date/time
 IODINE_UPSTREAM_SEND_CMD = "grep \"Sending .*via Iodine\" {log_file} | cut -d' ' -f1,2"
@@ -125,6 +120,19 @@ def extract_ts_and_last_int(line):
             
     return ts, val
 
+def parse_curl_data(log_file):
+    """Parses log for CURL DATA lines and returns a list of (timestamp, size)."""
+    lines = execute_shell_command(RACEBOAT_CURL_DATA_CMD, log_file)
+    data_points = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2: continue
+        ts = get_utc_timestamp(" ".join(parts[:2]))
+        size_match = re.search(r'CURL DATA (?:IN|OUT): (\d+) bytes', line)
+        if ts and size_match:
+            data_points.append({'ts': ts, 'size': int(size_match.group(1))})
+    return data_points
+
 def process_and_analyze_data(data, include_sizes=True):
     """Groups data by 'num_images' and calculates statistics for JSON output."""
     if not data: return {}
@@ -139,6 +147,7 @@ def process_and_analyze_data(data, include_sizes=True):
         }
         if 'direction' in item: entry['direction'] = item['direction']
         if 'operations' in item: entry['operations'] = item['operations']
+        if 'curl_size' in item: entry['curl_size'] = item['curl_size']
         if include_sizes: entry['sizes'] = item.get('sizes', [0])
         if 'zeekSizes' in item: entry['zeekSizes'] = item['zeekSizes']
         grouped_times[num_imgs].append(entry)
@@ -146,6 +155,7 @@ def process_and_analyze_data(data, include_sizes=True):
     analysis_results = {}
     for num_images in sorted(grouped_times.keys(), key=lambda x: int(x)):
         group_data = grouped_times[num_images]
+        if len(group_data) < 2: continue
         times_list = [e['duration'] for e in group_data]
         times_array = np.array(times_list)
         
@@ -183,7 +193,6 @@ def generate_event_models(output_data):
     # 2. Other Event Types (Aggregate across all groups)
     event_categories = [
         'iodineUpstream', 'iodineDownstream', 'raceboatFetching', 
-        'detailedDecodeBytes', 'decodeBytes',
         'tgenPosting', 'tgenFetching', 'tgenDns'
     ]
     
@@ -247,7 +256,6 @@ def parse_zeek_logs(glob_pattern):
 def correlate_zeek_to_events(events, zeek_data_nested, assigned_tracker, target_ip="10.20.1.5", required_prefix=None, continuous=False):
     """Aligns Zeek events to timed actions with safety checks for late-starting logs."""
     earliest_zeek_ts = float('inf')
-
     for script, ips in zeek_data_nested.items():
         if required_prefix and not script.startswith(required_prefix): continue
         if target_ip in ips:
@@ -255,25 +263,24 @@ def correlate_zeek_to_events(events, zeek_data_nested, assigned_tracker, target_
                 if entry['ts'] < earliest_zeek_ts: earliest_zeek_ts = entry['ts']
 
     sorted_events = sorted(events, key=lambda x: x.get('start_ts', 0))
+    for i, event in enumerate(sorted_events):
+        start = event.get('start_ts')
+        stop = sorted_events[i+1].get('start_ts') if continuous and i + 1 < len(sorted_events) else (event.get('stop_ts', float('inf')) if continuous else event.get('stop_ts'))
 
-    # for i, event in enumerate(sorted_events):
-    #     start = event.get('start_ts')
-    #     stop = sorted_events[i+1].get('start_ts') if continuous and i + 1 < len(sorted_events) else (event.get('stop_ts', float('inf')) if continuous else event.get('stop_ts'))
-
-    #     if start is None or stop is None: continue
-    #     if start < earliest_zeek_ts:
-    #         event['zeekSizes'] = []
-    #         continue
+        if start is None or stop is None: continue
+        if start < earliest_zeek_ts:
+            event['zeekSizes'] = []
+            continue
         
-    #     zeek_sizes = []
-    #     for script, ips in zeek_data_nested.items():
-    #         if required_prefix and not script.startswith(required_prefix): continue
-    #         if target_ip in ips:
-    #             for entry in ips[target_ip]:
-    #                 if start <= entry['ts'] < stop:
-    #                     zeek_sizes.append(entry['value'])
-    #                     assigned_tracker.add(entry['event_id'])
-    #     event['zeekSizes'] = zeek_sizes
+        zeek_sizes = []
+        for script, ips in zeek_data_nested.items():
+            if required_prefix and not script.startswith(required_prefix): continue
+            if target_ip in ips:
+                for entry in ips[target_ip]:
+                    if start <= entry['ts'] < stop:
+                        zeek_sizes.append(entry['value'])
+                        assigned_tracker.add(entry['event_id'])
+        event['zeekSizes'] = zeek_sizes
     return sorted_events
 
 def get_unassigned_zeek_stats(zeek_data_nested, assigned_tracker, target_ip="10.20.1.5"):
@@ -431,6 +438,8 @@ def parse_raceboat_posting(log_file):
     enqueue_lines = execute_shell_command(RACEBOAT_POSTING_IMAGES_CMD, log_file)
     start_lines = execute_shell_command(RACEBOAT_POSTING_START_CMD, log_file)
     stop_lines = execute_shell_command(RACEBOAT_POSTING_STOP_CMD, log_file)
+    curl_data = parse_curl_data(log_file)
+    
     action_data = {}
     for line in enqueue_lines:
         try:
@@ -451,7 +460,10 @@ def parse_raceboat_posting(log_file):
     correlated = sorted([{**m, 'start_ts': start_times[aid]} for aid, m in action_data.items() if aid in start_times], key=lambda x: x['start_ts'])
     final_data = []
     for event, stop in zip(correlated, stop_times):
-        if stop > event['start_ts']: final_data.append({**event, 'stop_ts': stop, 'elapsed_time': stop - event['start_ts']})
+        if stop > event['start_ts']:
+            # Sum CURL data associated with this event window
+            c_size = sum(c['size'] for c in curl_data if event['start_ts'] <= c['ts'] <= stop)
+            final_data.append({**event, 'stop_ts': stop, 'elapsed_time': stop - event['start_ts'], 'curl_size': c_size})
     return final_data
 
 def parse_detailed_raceboat_posting(log_file, base_events):
@@ -462,6 +474,7 @@ def parse_detailed_raceboat_posting(log_file, base_events):
     image_lines = execute_shell_command(RACEBOAT_DETAILED_IMAGE_CMD, log_file)
     status_lines = execute_shell_command(RACEBOAT_DETAILED_STATUS_CMD, log_file)
     end_lines = execute_shell_command(RACEBOAT_DETAILED_END_CMD, log_file)
+    curl_data = parse_curl_data(log_file)
 
     all_ops = []
     for label, lines in [('image', image_lines), ('status', status_lines), ('end', end_lines)]:
@@ -524,13 +537,17 @@ def parse_detailed_raceboat_posting(log_file, base_events):
                         'order': j
                     })
 
+                # Sum CURL data associated with this event window
+                c_size = sum(c['size'] for c in curl_data if start <= c['ts'] <= stop)
+
                 final_events.append({
                     'num_images': image_count,
                     'start_ts': start,
                     'stop_ts': stop,
                     'elapsed_time': stop - start,
                     'sizes': sizes_captured,
-                    'operations': detailed_ops
+                    'operations': detailed_ops,
+                    'curl_size': c_size
                 })
                 event = None
     return final_events
@@ -544,6 +561,7 @@ def parse_raceboat_fetching(log_file):
     starts = execute_shell_command(RACEBOAT_FETCHING_START_CMD, log_file)
     ends = execute_shell_command(RACEBOAT_FETCHING_END_CMD, log_file)
     each_entries = execute_shell_command(RACEBOAT_FETCHING_EACH_CMD, log_file)
+    curl_data = parse_curl_data(log_file)
 
     parsed_starts = sorted([t for t in [get_utc_timestamp(s) for s in starts] if t])
     parsed_ends = []
@@ -568,163 +586,18 @@ def parse_raceboat_fetching(log_file):
         if matching_end:
             stop = matching_end['ts']
             sizes = [e['size'] for e in parsed_each if start <= e['ts'] < next_start_limit]
+            
+            # Sum CURL data associated with this event window
+            c_size = sum(c['size'] for c in curl_data if start <= c['ts'] <= stop)
+
             final_data.append({
                 'num_images': matching_end['count'],
                 'elapsed_time': stop - start,
                 'start_ts': start,
                 'stop_ts': stop,
-                'sizes': sizes
+                'sizes': sizes,
+                'curl_size': c_size
             })
-
-    return final_data
-
-def parse_detailed_decode_bytes(log_file):
-    """
-    Parses detailedDecodeBytes events: tracks from decodeBytes call to onBytesDecoded callback.
-    Groups events by handle ID and matches start/stop pairs.
-    """
-    start_lines = execute_shell_command(RACEBOAT_DETAILED_DECODE_START_CMD, log_file)
-    end_lines = execute_shell_command(RACEBOAT_DETAILED_DECODE_END_CMD, log_file)
-    
-    # Parse start events with handle and size
-    start_events = []
-    for line in start_lines:
-        try:
-            parts = line.split()
-            if len(parts) < 2: continue
-            ts = get_utc_timestamp(" ".join(parts[:2]))
-            
-            # Extract handle number
-            handle_match = re.search(r'handle=(\d+)', line)
-            # Extract bytes.size() from the decodeBytes call
-            size_match = re.search(r'bytes\.size\(\)=(\d+)', line)
-            
-            if ts and handle_match:
-                start_events.append({
-                    'ts': ts,
-                    'handle': int(handle_match.group(1)),
-                    'input_size': int(size_match.group(1)) if size_match else 0
-                })
-        except Exception:
-            continue
-    
-    # Parse end events with handle and output size
-    end_events = []
-    for line in end_lines:
-        try:
-            parts = line.split()
-            if len(parts) < 2: continue
-            ts = get_utc_timestamp(" ".join(parts[:2]))
-            
-            # Extract handle and postId
-            handle_match = re.search(r'handle=(\d+)', line)
-            post_id_match = re.search(r'postId=(\d+)', line)
-            # Extract output bytes.size()
-            size_match = re.search(r'bytes\.size\(\)=(\d+)', line)
-            
-            if ts and handle_match:
-                end_events.append({
-                    'ts': ts,
-                    'handle': int(handle_match.group(1)),
-                    'post_id': int(post_id_match.group(1)) if post_id_match else None,
-                    'output_size': int(size_match.group(1)) if size_match else 0
-                })
-        except Exception:
-            continue
-    
-    # Match start and end events by handle
-    start_events.sort(key=lambda x: (x['handle'], x['ts']))
-    end_events.sort(key=lambda x: (x['handle'], x['ts']))
-    
-    final_data = []
-    handle_groups = defaultdict(list)
-    for event in start_events:
-        handle_groups[event['handle']].append(event)
-    
-    for end in end_events:
-        handle = end['handle']
-        if handle in handle_groups and handle_groups[handle]:
-            # Match with the first available start event for this handle
-            start = handle_groups[handle].pop(0)
-            if end['ts'] > start['ts']:
-                final_data.append({
-                    'num_images': 1,
-                    'elapsed_time': end['ts'] - start['ts'],
-                    'start_ts': start['ts'],
-                    'stop_ts': end['ts'],
-                    'handle': handle,
-                    'post_id': end['post_id'],
-                    'sizes': [start['input_size'], end['output_size']]
-                })
-    
-    return final_data
-
-def parse_decode_bytes(log_file):
-    """
-    Parses decodeBytes events: tracks from Link::fetch to receiveEncPkg.
-    Matches based on temporal proximity.
-    """
-    start_lines = execute_shell_command(RACEBOAT_DECODE_START_CMD, log_file)
-    end_lines = execute_shell_command(RACEBOAT_DECODE_END_CMD, log_file)
-    
-    # Parse start events (Link::fetch)
-    start_events = []
-    for line in start_lines:
-        try:
-            parts = line.split()
-            if len(parts) < 2: continue
-            ts = get_utc_timestamp(" ".join(parts[:2]))
-            
-            # Extract number of items fetched
-            count_match = re.search(r'Fetched (\d+) items', line)
-            
-            if ts and count_match:
-                start_events.append({
-                    'ts': ts,
-                    'count': int(count_match.group(1))
-                })
-        except Exception:
-            continue
-    
-    # Parse end events (receiveEncPkg)
-    end_events = []
-    for line in end_lines:
-        try:
-            parts = line.split()
-            if len(parts) < 2: continue
-            ts = get_utc_timestamp(" ".join(parts[:2]))
-            
-            # Extract postId
-            post_id_match = re.search(r'postId: (\d+)', line)
-            
-            if ts:
-                end_events.append({
-                    'ts': ts,
-                    'post_id': int(post_id_match.group(1)) if post_id_match else None
-                })
-        except Exception:
-            continue
-    
-    # Match start and end events by temporal order
-    start_events.sort(key=lambda x: x['ts'])
-    end_events.sort(key=lambda x: x['ts'])
-    
-    final_data = []
-    for start in start_events:
-        # Find the next end event after this start
-        matching_end = next((e for e in end_events if e['ts'] > start['ts']), None)
-        if matching_end:
-            final_data.append({
-                'num_images': start['count'],
-                'elapsed_time': matching_end['ts'] - start['ts'],
-                'start_ts': start['ts'],
-                'stop_ts': matching_end['ts'],
-                'post_id': matching_end['post_id'],
-                'sizes': [0]  # No size information available in these logs
-            })
-            # Remove the matched end event to avoid reusing it
-            end_events.remove(matching_end)
-    
     return final_data
 
 def parse_iodine_duration(send_cmd, recv_cmd, send_log, recv_log, direction):
@@ -770,14 +643,6 @@ if __name__ == "__main__":
     detailed_rb_post = parse_detailed_raceboat_posting(RB_POST_LOG, rb_post_base)
     output['detailedRaceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(detailed_rb_post, zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
 
-    # Detailed Decode Bytes Analysis
-    detailed_decode_data = parse_detailed_decode_bytes(RB_FETCH_LOG)
-    output['detailedDecodeBytes'] = process_and_analyze_data(correlate_zeek_to_events(detailed_decode_data, zeek_post, apost, "10.20.0.3", "HTTPS_", True))
-
-    # Decode Bytes Analysis
-    decode_data = parse_decode_bytes(RB_FETCH_LOG)
-    output['decodeBytes'] = process_and_analyze_data(correlate_zeek_to_events(decode_data, zeek_post, apost, "10.20.0.3", "HTTPS_", True))
-
     # Tgen Metrics
     tgen_dns_data = parse_tgen_dns(glob.glob(os.path.join(ROOT_DIR, "tgen_logs", "dns_client_group_*", "logs", "user*.log")))
     output['tgenDns'] = process_and_analyze_data(tgen_dns_data, False)
@@ -797,8 +662,6 @@ if __name__ == "__main__":
         (rb_post_base, 'raceboatPosting'),
         (rb_fetch_data, 'raceboatFetching'),
         (detailed_rb_post, 'detailedRaceboatPosting'),
-        (detailed_decode_data, 'detailedDecodeBytes'),
-        (decode_data, 'decodeBytes'),
         (tgen_dns_data, 'tgenDns'),
         (tgen_post_data, 'tgenPosting'),
         (tgen_fetch_data, 'tgenFetching')
@@ -807,11 +670,13 @@ if __name__ == "__main__":
     for source_list, event_type in event_sources:
         for event in source_list:
             if 'start_ts' in event and 'stop_ts' in event:
-                raw_timeline.append({
+                item = {
                     'type': event_type,
                     'start_ts': event['start_ts'],
                     'stop_ts': event['stop_ts']
-                })
+                }
+                if 'curl_size' in event: item['curl_size'] = event['curl_size']
+                raw_timeline.append(item)
     
     # Trim logic: start at first iodineUpstream, end at last iodineDownstream
     upstream_starts = [e['start_ts'] for e in up_data if 'start_ts' in e]
@@ -823,8 +688,6 @@ if __name__ == "__main__":
         
         trimmed_timeline = []
         for event in raw_timeline:
-            # Keep events that occur (even partially) within the ref window
-            # but standard interpretation is usually based on start_ts being within window
             if event['start_ts'] >= ref_start and event['stop_ts'] <= ref_stop:
                 event['relative_start_ts'] = event['start_ts'] - ref_start
                 event['relative_stop_ts'] = event['stop_ts'] - ref_start
