@@ -33,6 +33,12 @@ RACEBOAT_FETCHING_START_CMD = "grep \"PluginMastodon::doAction: Fetching from si
 RACEBOAT_FETCHING_END_CMD = "grep \"Link::fetch: Fetched [0-9]\\+ items\" {log_file} | cut -d' ' -f1,2,7,8,9"
 RACEBOAT_FETCHING_EACH_CMD = "grep \"Link::fetch: Fetched image content\" {log_file} | cut -d' ' -f1,2,10,11,12"
 
+# Detailed Raceboat Fetching Commands
+RACEBOAT_DETAILED_FETCH_IMAGE_START_CMD = "grep \"MastodonClient::searchStatuses: calling downlaod for url\" {log_file}"
+RACEBOAT_DETAILED_FETCH_IMAGE_STOP_CMD = "grep \"MastodonClient::searchStatuses: Downloaded image, size:\" {log_file}"
+RACEBOAT_DETAILED_FETCH_STATUS_START_CMD = "grep \"MastodonClient::searchStatuses: Searching for hashtag\" {log_file}"
+RACEBOAT_DETAILED_FETCH_STATUS_END_CMD = "grep \"MastodonClient::searchStatuses: parsing response\" {log_file}"
+
 # CURL Data Analysis Command
 RACEBOAT_CURL_DATA_CMD = "grep -E \"CURL DATA IN|CURL DATA OUT\" {log_file}"
 
@@ -155,12 +161,14 @@ def process_and_analyze_data(data, include_sizes=True):
     analysis_results = {}
     for num_images in sorted(grouped_times.keys(), key=lambda x: int(x)):
         group_data = grouped_times[num_images]
-        if len(group_data) < 2: continue
         times_list = [e['duration'] for e in group_data]
         times_array = np.array(times_list)
         
+        # Calculate CURL stats if present
+        curl_list = [e['curl_size'] for e in group_data if 'curl_size' in e]
+        
         analysis_results[str(num_images)] = {
-            'count': len(times_list),
+            'count': len(group_data),
             'min': float(np.min(times_array)),
             'max': float(np.max(times_array)),
             'mean': float(np.mean(times_array)),
@@ -169,6 +177,11 @@ def process_and_analyze_data(data, include_sizes=True):
             'emd_vs_normal': float(wasserstein_distance(times_array, np.random.normal(np.mean(times_array), np.std(times_array), len(times_array)*10)) if np.std(times_array) > 0 else 0),
             'data': group_data
         }
+        
+        if curl_list:
+            analysis_results[str(num_images)]['curl_total'] = float(np.sum(curl_list))
+            analysis_results[str(num_images)]['curl_mean'] = float(np.mean(curl_list))
+            
     return analysis_results
 
 def generate_event_models(output_data):
@@ -469,7 +482,7 @@ def parse_raceboat_posting(log_file):
 def parse_detailed_raceboat_posting(log_file, base_events):
     """
     Parses detailed posting events and tracks Sizes for operations.
-    Matches image sizes from standard base_events and sets status size to 165.
+    Includes per-operation curl_size breakdown.
     """
     image_lines = execute_shell_command(RACEBOAT_DETAILED_IMAGE_CMD, log_file)
     status_lines = execute_shell_command(RACEBOAT_DETAILED_STATUS_CMD, log_file)
@@ -505,7 +518,6 @@ def parse_detailed_raceboat_posting(log_file, base_events):
             elif op['type'] == 'end' and event:
                 start, stop, q = event['start_ts'], op['ts'], event['ops_queue']
                 
-                # Find matching non-detailed event to pull sizes
                 base_match = min(base_events, key=lambda x: abs(x['start_ts'] - start))
                 is_valid_match = abs(base_match['start_ts'] - start) < 1.0
                 
@@ -519,7 +531,6 @@ def parse_detailed_raceboat_posting(log_file, base_events):
                     seg_stop = q[j+1]['ts'] if j+1 < len(q) else stop
                     op_type = q[j]['type']
                     
-                    # Size logic
                     op_size = 0
                     if op_type == 'image':
                         image_count += 1
@@ -529,15 +540,17 @@ def parse_detailed_raceboat_posting(log_file, base_events):
                     elif op_type == 'status':
                         op_size = 165
                     
+                    op_curl_size = sum(c['size'] for c in curl_data if seg_start <= c['ts'] <= seg_stop)
+                    
                     sizes_captured.append(op_size)
                     detailed_ops.append({
                         'type': op_type,
                         'duration': seg_stop - seg_start,
                         'size': op_size,
+                        'curl_size': op_curl_size,
                         'order': j
                     })
 
-                # Sum CURL data associated with this event window
                 c_size = sum(c['size'] for c in curl_data if start <= c['ts'] <= stop)
 
                 final_events.append({
@@ -552,11 +565,84 @@ def parse_detailed_raceboat_posting(log_file, base_events):
                 event = None
     return final_events
 
+def parse_detailed_raceboat_fetching(log_file, base_events):
+    """
+    Parses detailed fetching events (search and image download sub-steps).
+    Includes per-operation curl_size breakdown.
+    """
+    img_start_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_IMAGE_START_CMD, log_file)
+    img_stop_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_IMAGE_STOP_CMD, log_file)
+    status_start_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_STATUS_START_CMD, log_file)
+    status_end_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_STATUS_END_CMD, log_file)
+    curl_data = parse_curl_data(log_file)
+
+    all_ops = []
+    for label, lines in [('fetch_image_start', img_start_lines), ('fetch_image_stop', img_stop_lines), 
+                         ('fetch_status_start', status_start_lines), ('fetch_status_end', status_end_lines)]:
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 3: continue
+            ts = get_utc_timestamp(" ".join(parts[:2]))
+            thread_match = re.search(r'thread=([0-9a-f]+)', line)
+            
+            # Extract size for image stop lines
+            size = 0
+            if label == 'fetch_image_stop':
+                size_match = re.search(r'size: (\d+)', line)
+                if size_match: size = int(size_match.group(1))
+
+            if ts and thread_match:
+                all_ops.append({'ts': ts, 'thread': thread_match.group(1), 'type': label, 'size': size})
+
+    all_ops.sort(key=lambda x: x['ts'])
+    thread_groups = defaultdict(list)
+    for op in all_ops: thread_groups[op['thread']].append(op)
+
+    final_events = []
+    for thread, ops in thread_groups.items():
+        # A fetch sequence often starts with status search then image downloads
+        # We group them into 'operations' based on start/stop pairs
+        current_ops = []
+        i = 0
+        while i < len(ops):
+            op = ops[i]
+            if op['type'] == 'fetch_status_start':
+                nxt = next((o for o in ops[i+1:] if o['type'] == 'fetch_status_end'), None)
+                if nxt:
+                    duration = nxt['ts'] - op['ts']
+                    c_size = sum(c['size'] for c in curl_data if op['ts'] <= c['ts'] <= nxt['ts'])
+                    current_ops.append({'type': 'fetch_status', 'duration': duration, 'start_ts': op['ts'], 'stop_ts': nxt['ts'], 'curl_size': c_size})
+            elif op['type'] == 'fetch_image_start':
+                nxt = next((o for o in ops[i+1:] if o['type'] == 'fetch_image_stop'), None)
+                if nxt:
+                    duration = nxt['ts'] - op['ts']
+                    c_size = sum(c['size'] for c in curl_data if op['ts'] <= c['ts'] <= nxt['ts'])
+                    current_ops.append({'type': 'fetch_image', 'duration': duration, 'start_ts': op['ts'], 'stop_ts': nxt['ts'], 'size': nxt['size'], 'curl_size': c_size})
+            i += 1
+            
+        if not current_ops: continue
+        
+        # Correlate with base events to find the group (number of images)
+        start_ts = min(o['start_ts'] for o in current_ops)
+        stop_ts = max(o['stop_ts'] for o in current_ops)
+        
+        base_match = min(base_events, key=lambda x: abs(x['start_ts'] - start_ts))
+        num_imgs = base_match['num_images'] if abs(base_match['start_ts'] - start_ts) < 5.0 else len([o for o in current_ops if o['type'] == 'fetch_image'])
+
+        final_events.append({
+            'num_images': num_imgs,
+            'start_ts': start_ts,
+            'stop_ts': stop_ts,
+            'elapsed_time': stop_ts - start_ts,
+            'operations': current_ops,
+            'curl_size': sum(o['curl_size'] for o in current_ops)
+        })
+        
+    return final_events
+
 def parse_raceboat_fetching(log_file):
     """
     Parses Raceboat fetching events using separate greps.
-    Fix: FETCHING_EACH statements often occur after FETCHING_END. 
-    We match each start with the next occurring start to define the collection window for 'each' sizes.
     """
     starts = execute_shell_command(RACEBOAT_FETCHING_START_CMD, log_file)
     ends = execute_shell_command(RACEBOAT_FETCHING_END_CMD, log_file)
@@ -586,8 +672,6 @@ def parse_raceboat_fetching(log_file):
         if matching_end:
             stop = matching_end['ts']
             sizes = [e['size'] for e in parsed_each if start <= e['ts'] < next_start_limit]
-            
-            # Sum CURL data associated with this event window
             c_size = sum(c['size'] for c in curl_data if start <= c['ts'] <= stop)
 
             final_data.append({
@@ -623,27 +707,26 @@ if __name__ == "__main__":
     output['zeek_metrics'] = {'pre_nat': zeek_pre, 'post_nat': zeek_post}
     apre, apost = set(), set()
 
-    # --- Data Collection for Analysis and Timeline ---
+    # --- Data Collection ---
     
-    # Iodine Analyses
     up_data = parse_iodine_duration(IODINE_UPSTREAM_SEND_CMD, IODINE_UPSTREAM_RECV_CMD, APP_CLIENT_LOG, APP_SERVER_LOG, "upstream")
     output['iodineUpstream'] = process_and_analyze_data(correlate_zeek_to_events(up_data, zeek_pre, apre, "10.20.1.5", "DNS_"), False)
     
     down_data = parse_iodine_duration(IODINE_DOWNSTREAM_SEND_CMD, IODINE_DOWNSTREAM_RECV_CMD, APP_SERVER_LOG, APP_CLIENT_LOG, "downstream")
     output['iodineDownstream'] = process_and_analyze_data(correlate_zeek_to_events(down_data, zeek_post, apost, "10.20.0.3", "DNS_"), False)
 
-    # Raceboat Analyses
     rb_post_base = parse_raceboat_posting(RB_POST_LOG)
     output['raceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(rb_post_base, zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
     
-    rb_fetch_data = parse_raceboat_fetching(RB_FETCH_LOG)
-    output['raceboatFetching'] = process_and_analyze_data(correlate_zeek_to_events(rb_fetch_data, zeek_post, apost, "10.20.0.3", "HTTPS_", True))
+    rb_fetch_base = parse_raceboat_fetching(RB_FETCH_LOG)
+    output['raceboatFetching'] = process_and_analyze_data(correlate_zeek_to_events(rb_fetch_base, zeek_post, apost, "10.20.0.3", "HTTPS_", True))
 
-    # Detailed Raceboat Posting Analysis
     detailed_rb_post = parse_detailed_raceboat_posting(RB_POST_LOG, rb_post_base)
     output['detailedRaceboatPosting'] = process_and_analyze_data(correlate_zeek_to_events(detailed_rb_post, zeek_pre, apre, "10.20.1.5", "HTTPS_", True))
 
-    # Tgen Metrics
+    detailed_rb_fetch = parse_detailed_raceboat_fetching(RB_FETCH_LOG, rb_fetch_base)
+    output['detailedRaceboatFetching'] = process_and_analyze_data(correlate_zeek_to_events(detailed_rb_fetch, zeek_post, apost, "10.20.0.3", "HTTPS_", True))
+
     tgen_dns_data = parse_tgen_dns(glob.glob(os.path.join(ROOT_DIR, "tgen_logs", "dns_client_group_*", "logs", "user*.log")))
     output['tgenDns'] = process_and_analyze_data(tgen_dns_data, False)
     
@@ -653,56 +736,40 @@ if __name__ == "__main__":
     tgen_fetch_data = parse_tgen_fetching(TGEN_MASTODON_FILES)
     output['tgenFetching'] = process_and_analyze_data(tgen_fetch_data)
 
-    # --- Chronological Event Timeline Generation ---
-    
+    # --- Timeline Generation ---
     raw_timeline = []
     event_sources = [
-        (up_data, 'iodineUpstream'),
-        (down_data, 'iodineDownstream'),
-        (rb_post_base, 'raceboatPosting'),
-        (rb_fetch_data, 'raceboatFetching'),
-        (detailed_rb_post, 'detailedRaceboatPosting'),
-        (tgen_dns_data, 'tgenDns'),
-        (tgen_post_data, 'tgenPosting'),
-        (tgen_fetch_data, 'tgenFetching')
+        (up_data, 'iodineUpstream'), (down_data, 'iodineDownstream'),
+        (rb_post_base, 'raceboatPosting'), (rb_fetch_base, 'raceboatFetching'),
+        (detailed_rb_post, 'detailedRaceboatPosting'), (detailed_rb_fetch, 'detailedRaceboatFetching'),
+        (tgen_dns_data, 'tgenDns'), (tgen_post_data, 'tgenPosting'), (tgen_fetch_data, 'tgenFetching')
     ]
     
     for source_list, event_type in event_sources:
         for event in source_list:
             if 'start_ts' in event and 'stop_ts' in event:
-                item = {
-                    'type': event_type,
-                    'start_ts': event['start_ts'],
-                    'stop_ts': event['stop_ts']
-                }
+                item = {'type': event_type, 'start_ts': event['start_ts'], 'stop_ts': event['stop_ts']}
                 if 'curl_size' in event: item['curl_size'] = event['curl_size']
                 raw_timeline.append(item)
     
-    # Trim logic: start at first iodineUpstream, end at last iodineDownstream
     upstream_starts = [e['start_ts'] for e in up_data if 'start_ts' in e]
     downstream_stops = [e['stop_ts'] for e in down_data if 'stop_ts' in e]
     
     if upstream_starts and downstream_stops:
-        ref_start = min(upstream_starts)
-        ref_stop = max(downstream_stops)
-        
-        trimmed_timeline = []
+        ref_start, ref_stop = min(upstream_starts), max(downstream_stops)
+        trimmed = []
         for event in raw_timeline:
             if event['start_ts'] >= ref_start and event['stop_ts'] <= ref_stop:
                 event['relative_start_ts'] = event['start_ts'] - ref_start
                 event['relative_stop_ts'] = event['stop_ts'] - ref_start
-                trimmed_timeline.append(event)
-        
-        trimmed_timeline.sort(key=lambda x: x['start_ts'])
-        output['event_timeline'] = trimmed_timeline
+                trimmed.append(event)
+        trimmed.sort(key=lambda x: x['start_ts'])
+        output['event_timeline'] = trimmed
     else:
         output['event_timeline'] = []
 
-    # --- Remaining Metrics ---
     output['unassigned_zeek_metrics'] = {'pre_nat': get_unassigned_zeek_stats(zeek_pre, apre, "10.20.1.5"), 'post_nat': get_unassigned_zeek_stats(zeek_post, apost, "10.20.0.3")}
     output['dns_activity_comparison'] = analyze_iodine_dns_activity(up_data, down_data, zeek_pre, "10.20.1.5")
-
-    # Final Summary Gaussian Models
     output['event_gaussian_models'] = generate_event_models(output)
 
     with open(RESULTS_FILE, 'w') as f:
