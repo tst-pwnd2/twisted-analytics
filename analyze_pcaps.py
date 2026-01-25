@@ -237,11 +237,11 @@ def sort_packets_in_events(events: list[dict]):
         event["packets"].sort(key=lambda p: p["time"])
 
 
-def assign_packets_to_post_operations(events):
+def assign_packets_to_operations(events, direction='upstream'):
     for event in events:
         if (
             event["eventType"] != "raceboat"
-            or event["direction"] != "upstream"
+            or event["direction"] != direction
             or not event.get("operations")
         ):
             continue
@@ -360,7 +360,7 @@ def raceboat_post(pcapfile: str, eventsfile: str, out: str):
     assign_dns_packets_to_events(events, packets, domain="mastodon.pwnd.com")
     assign_http_packets_to_events(events, packets)
     sort_packets_in_events(events)
-    assign_packets_to_post_operations(events)
+    assign_packets_to_operations(events, direction='upstream')
 
     with open(out, "w", encoding="UTF-8") as outfile:
         json.dump(events, outfile, indent=2, default=str)
@@ -382,14 +382,14 @@ def raceboat_fetch(pcapfile: str, eventsfile: str, out: str):
         eventsdata: dict = json.load(infile)
 
     events = create_continuous_event_timeline(
-        parse_events(eventsdata, "raceboatFetching.*.data", "raceboat", "downstream")
+        parse_events(eventsdata, "detailedRaceboatFetching.*.data", "raceboat", "downstream")
     )
 
     packets = rdpcap(pcapfile)
     assign_dns_packets_to_events(events, packets, domain="mastodon.pwnd.com")
     assign_http_packets_to_events(events, packets)
     sort_packets_in_events(events)
-
+    assign_packets_to_operations(events, direction='downstream')
     with open(out, "w", encoding="UTF-8") as outfile:
         json.dump(events, outfile, indent=2, default=str)
 
