@@ -27,6 +27,7 @@ RACEBOAT_POSTING_STOP_CMD = "grep \"PluginCommsTwoSixStubUserModelReactiveFile::
 RACEBOAT_DETAILED_IMAGE_CMD = "grep \"MastodonClient::postStatus: posting image\" {log_file}"
 RACEBOAT_DETAILED_STATUS_CMD = "grep \"MastodonClient::postStatus: status URL\" {log_file}"
 RACEBOAT_DETAILED_END_CMD = "grep \"Raceboat::ComponentManager::onEvent: called with event=Event{{}}\" {log_file}"
+RACEBOAT_DETAILED_POST_CONNECTION_ESTABLISHED = "grep \"): CURL INFO: Connected to mastodon.pwnd.com\" {log_file}"
 
 # Reverted to multiple grep commands for fetching
 RACEBOAT_FETCHING_START_CMD = "grep \"PluginMastodon::doAction: Fetching from single link\" {log_file} | cut -d' ' -f1,2"
@@ -38,6 +39,7 @@ RACEBOAT_DETAILED_FETCH_IMAGE_START_CMD = "grep \"MastodonClient::searchStatuses
 RACEBOAT_DETAILED_FETCH_IMAGE_STOP_CMD = "grep \"MastodonClient::searchStatuses: Downloaded image, size:\" {log_file}"
 RACEBOAT_DETAILED_FETCH_STATUS_START_CMD = "grep \"MastodonClient::searchStatuses: Searching for hashtag\" {log_file}"
 RACEBOAT_DETAILED_FETCH_STATUS_END_CMD = "grep \"MastodonClient::searchStatuses: parsing response\" {log_file}"
+RACEBOAT_DETAILED_FETCH_CONNECTION_ESTABLISHED = "grep \"MastodonClient::downloadImage: CURL INFO: Connected to\" {log_file}"
 
 # CURL Data Analysis Command
 RACEBOAT_CURL_DATA_CMD = "grep -E \"CURL DATA IN|CURL DATA OUT\" {log_file}"
@@ -482,15 +484,19 @@ def parse_raceboat_posting(log_file):
 def parse_detailed_raceboat_posting(log_file, base_events):
     """
     Parses detailed posting events and tracks Sizes for operations.
-    Includes per-operation curl_size breakdown.
+    Includes per-operation curl_size breakdown and dns_duration/http_duration.
     """
     image_lines = execute_shell_command(RACEBOAT_DETAILED_IMAGE_CMD, log_file)
     status_lines = execute_shell_command(RACEBOAT_DETAILED_STATUS_CMD, log_file)
     end_lines = execute_shell_command(RACEBOAT_DETAILED_END_CMD, log_file)
+    connection_lines = execute_shell_command(RACEBOAT_DETAILED_POST_CONNECTION_ESTABLISHED, log_file)
     curl_data = parse_curl_data(log_file)
 
     all_ops = []
-    for label, lines in [('image', image_lines), ('status', status_lines), ('end', end_lines)]:
+    for label, lines in [('image', image_lines), 
+                         ('status', status_lines), 
+                         ('end', end_lines), 
+                         ('connection', connection_lines)]:
         for line in lines:
             parts = line.split()
             if len(parts) < 3: continue
@@ -515,6 +521,8 @@ def parse_detailed_raceboat_posting(log_file, base_events):
                     event['ops_queue'].append(op)
             elif op['type'] == 'status' and event:
                 event['ops_queue'].append(op)
+            elif op['type'] == 'connection' and event:
+                event['ops_queue'].append(op)
             elif op['type'] == 'end' and event:
                 start, stop, q = event['start_ts'], op['ts'], event['ops_queue']
                 
@@ -527,9 +535,19 @@ def parse_detailed_raceboat_posting(log_file, base_events):
                 sizes_captured = []
                 
                 for j in range(len(q)):
-                    seg_start = q[j]['ts']
-                    seg_stop = q[j+1]['ts'] if j+1 < len(q) else stop
                     op_type = q[j]['type']
+                    
+                    # Skip connection events in the iteration (they're used for duration calculation)
+                    if op_type == 'connection':
+                        continue
+                    
+                    seg_start = q[j]['ts']
+                    # Find next non-connection event for seg_stop
+                    seg_stop = stop  # default to overall stop
+                    for k in range(j+1, len(q)):
+                        if q[k]['type'] != 'connection':
+                            seg_stop = q[k]['ts']
+                            break
                     
                     op_size = 0
                     if op_type == 'image':
@@ -542,12 +560,27 @@ def parse_detailed_raceboat_posting(log_file, base_events):
                     
                     op_curl_size = sum(c['size'] for c in curl_data if seg_start <= c['ts'] <= seg_stop)
                     
+                    # Calculate dns_duration and http_duration if connection event exists
+                    dns_duration = 0.0
+                    http_duration = 0.0
+                    if op_type in ['image', 'status']:
+                        # Find connection event between seg_start and seg_stop
+                        connection_events = [op for op in q if op['type'] == 'connection' and seg_start <= op['ts'] <= seg_stop]
+                        if connection_events:
+                            conn_ts = connection_events[0]['ts']
+                            dns_duration = conn_ts - seg_start
+                            http_duration = seg_stop - conn_ts
+                        else:
+                            http_duration = seg_stop - seg_start
+                    
                     sizes_captured.append(op_size)
                     detailed_ops.append({
                         'type': op_type,
                         'duration': seg_stop - seg_start,
                         'size': op_size,
                         'curl_size': op_curl_size,
+                        'dns_duration': dns_duration,
+                        'http_duration': http_duration,
                         'order': j
                     })
 
@@ -568,17 +601,19 @@ def parse_detailed_raceboat_posting(log_file, base_events):
 def parse_detailed_raceboat_fetching(log_file, base_events):
     """
     Parses detailed fetching events (search and image download sub-steps).
-    Includes per-operation curl_size breakdown.
+    Includes per-operation curl_size breakdown and dns_duration/http_duration.
     """
     img_start_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_IMAGE_START_CMD, log_file)
     img_stop_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_IMAGE_STOP_CMD, log_file)
     status_start_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_STATUS_START_CMD, log_file)
     status_end_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_STATUS_END_CMD, log_file)
+    connection_lines = execute_shell_command(RACEBOAT_DETAILED_FETCH_CONNECTION_ESTABLISHED, log_file)
     curl_data = parse_curl_data(log_file)
 
     all_ops = []
     for label, lines in [('fetch_image_start', img_start_lines), ('fetch_image_stop', img_stop_lines), 
-                         ('fetch_status_start', status_start_lines), ('fetch_status_end', status_end_lines)]:
+                         ('fetch_status_start', status_start_lines), ('fetch_status_end', status_end_lines),
+                         ('fetch_connection', connection_lines)]:
         for line in lines:
             parts = line.split()
             if len(parts) < 3: continue
@@ -611,13 +646,35 @@ def parse_detailed_raceboat_fetching(log_file, base_events):
                 if nxt:
                     duration = nxt['ts'] - op['ts']
                     c_size = sum(c['size'] for c in curl_data if op['ts'] <= c['ts'] <= nxt['ts'])
-                    current_ops.append({'type': 'fetch_status', 'duration': duration, 'start_ts': op['ts'], 'stop_ts': nxt['ts'], 'curl_size': c_size})
+                    
+                    # Calculate dns_duration and http_duration
+                    dns_duration = 0.0
+                    http_duration = 0.0
+                    connection_events = [o for o in ops if o['type'] == 'fetch_connection' and op['ts'] <= o['ts'] <= nxt['ts']]
+                    if connection_events:
+                        conn_ts = connection_events[0]['ts']
+                        dns_duration = conn_ts - op['ts']
+                        http_duration = nxt['ts'] - conn_ts
+                    else:
+                        http_duration = nxt['ts'] - op['ts']
+                    
+                    current_ops.append({'type': 'fetch_status', 'duration': duration, 'start_ts': op['ts'], 'stop_ts': nxt['ts'], 'curl_size': c_size, 'dns_duration': dns_duration, 'http_duration': http_duration})
             elif op['type'] == 'fetch_image_start':
                 nxt = next((o for o in ops[i+1:] if o['type'] == 'fetch_image_stop'), None)
                 if nxt:
                     duration = nxt['ts'] - op['ts']
                     c_size = sum(c['size'] for c in curl_data if op['ts'] <= c['ts'] <= nxt['ts'])
-                    current_ops.append({'type': 'fetch_image', 'duration': duration, 'start_ts': op['ts'], 'stop_ts': nxt['ts'], 'size': nxt['size'], 'curl_size': c_size})
+                    
+                    # Calculate dns_duration and http_duration
+                    dns_duration = None
+                    http_duration = None
+                    connection_events = [o for o in ops if o['type'] == 'fetch_connection' and op['ts'] <= o['ts'] <= nxt['ts']]
+                    if connection_events:
+                        conn_ts = connection_events[0]['ts']
+                        dns_duration = conn_ts - op['ts']
+                        http_duration = nxt['ts'] - conn_ts
+                    
+                    current_ops.append({'type': 'fetch_image', 'duration': duration, 'start_ts': op['ts'], 'stop_ts': nxt['ts'], 'size': nxt['size'], 'curl_size': c_size, 'dns_duration': dns_duration, 'http_duration': http_duration})
             i += 1
             
         if not current_ops: continue
