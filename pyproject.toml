@@ -8,6 +8,7 @@ dependencies = [
     "click>=8.3.1",
     "jsonpath-ng>=1.7.0",
     "numpy>=2.4.1",
+    "pydantic>=2.12.5",
     "pyyaml>=6.0.3",
     "scapy>=2.7.0",
     "scipy>=1.17.0",
